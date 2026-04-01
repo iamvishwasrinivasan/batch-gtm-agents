@@ -114,6 +114,8 @@ class ResearchResult:
     error_message: Optional[str] = None
     exa_metadata: Optional[Dict] = None  # v2: Enhanced Exa metadata
     comprehensive_report: Optional[str] = None  # v2: i360-style comprehensive report
+    structured_signals: Optional[str] = None  # v2: Full structured signals as JSON text
+    structured_tech_stack: Optional[str] = None  # v2: Full tech stack with confidence as JSON text
 
 # --- Exa v2 Infrastructure ---
 
@@ -1673,6 +1675,10 @@ def research_single_account(
 
         elapsed = time.time() - start_time
 
+        # Serialize v2 structured data to JSON strings
+        structured_signals_json = json.dumps(exa_v2_result.key_signals) if exa_v2_result.key_signals else None
+        structured_tech_stack_json = json.dumps(exa_v2_result.tech_stack) if exa_v2_result.tech_stack else None
+
         return ResearchResult(
             acct_id=acct_id,
             acct_name=account_name,
@@ -1691,7 +1697,9 @@ def research_single_account(
             processing_time_sec=elapsed,
             status='success',
             exa_metadata=exa_v2_result.metadata,  # v2: Enhanced metadata
-            comprehensive_report=comprehensive_report  # v2: i360-style report
+            comprehensive_report=comprehensive_report,  # v2: i360-style report
+            structured_signals=structured_signals_json,  # v2: Full structured signals
+            structured_tech_stack=structured_tech_stack_json  # v2: Full tech stack with confidence
         )
 
     except Exception as e:
@@ -1714,7 +1722,11 @@ def research_single_account(
             report_json_path='',
             processing_time_sec=elapsed,
             status='failed',
-            error_message=str(e)
+            error_message=str(e),
+            exa_metadata=None,
+            comprehensive_report=None,
+            structured_signals=None,
+            structured_tech_stack=None
         )
 
 # --- Save to Snowflake ---
@@ -1761,6 +1773,8 @@ def save_to_snowflake(results: List[ResearchResult]):
             # Extract v2 metadata if available
             exa_metadata = getattr(result, 'exa_metadata', None) or {}
             comprehensive_report = getattr(result, 'comprehensive_report', None)
+            structured_signals = getattr(result, 'structured_signals', None)
+            structured_tech_stack = getattr(result, 'structured_tech_stack', None)
 
             # Use INSERT INTO ... SELECT with PARSE_JSON to convert strings to ARRAY
             cursor.execute('''
@@ -1774,7 +1788,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 product_announcement_count, case_study_count,
                 website_crawled, job_descriptions_crawled,
                 exa_search_time_sec, exa_searches_completed, exa_searches_failed,
-                comprehensive_report
+                comprehensive_report,
+                structured_signals, structured_tech_stack
             )
             SELECT
                 %s, %s, %s, %s,
@@ -1785,7 +1800,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 %s, %s, %s, %s, %s,
                 %s, %s,
                 %s, %s, %s,
-                %s
+                %s,
+                %s, %s
             ''', (
                 result.acct_id, result.acct_name, result.tier, result.priority_score,
                 result.has_sf_context, result.contact_count, result.mql_count,
@@ -1803,7 +1819,9 @@ def save_to_snowflake(results: List[ResearchResult]):
                 exa_metadata.get('total_time_sec', 0.0),
                 exa_metadata.get('searches_completed', 0),
                 exa_metadata.get('searches_failed', 0),
-                comprehensive_report
+                comprehensive_report,
+                structured_signals,
+                structured_tech_stack
             ))
             log(f"✓ Saved {result.acct_name} to Snowflake")
         except Exception as e:

@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Environment & Secrets
+.env
+*.key
+*.pem
+*.p8
+rsa_key*
+*_key.json
+credentials.json
+config.yaml
+service_config.yaml
+
+# API Keys & Credentials
+*API_KEY*
+*api_key*
+*_token*
+*.token
+
+# Snowflake
+.snowflake/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Output & Logs
+*.log
+*.out
+batch-research-output/
+claude-work/
+Account\ Context/
+Pipeline\ Reports/
+*.json
+!prompts/**/*.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.cache
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Large data files
+*.csv
+*.parquet
+*.db
+*.sqlite
+
+# Sensitive data
+gong-cache/
+*_cache/
+transcripts/

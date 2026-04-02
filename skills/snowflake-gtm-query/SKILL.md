@@ -111,43 +111,22 @@ Categorize the query type:
    Find the account folder (slugified name)
    Read `raw_data.json` if found and recent
 
-2. **If no local data, use helper script:**
+2. **If no local data, use helper script for account lookups:**
    ```bash
    python3 ~/batch-gtm-agents/query_account.py "Company Name"
    ```
 
-3. **For custom queries, write Python script:**
-   Use the Snowflake connector template:
-   ```python
-   import snowflake.connector
-   from cryptography.hazmat.backends import default_backend
-   from cryptography.hazmat.primitives import serialization
-   from pathlib import Path
-
-   with open(Path.home() / ".ssh/rsa_key_unencrypted.p8", 'rb') as f:
-       p_key = serialization.load_pem_private_key(
-           f.read(), password=None, backend=default_backend()
-       )
-   
-   pk_bytes = p_key.private_bytes(
-       encoding=serialization.Encoding.DER,
-       format=serialization.PrivateFormat.PKCS8,
-       encryption_algorithm=serialization.NoEncryption()
-   )
-   
-   conn = snowflake.connector.connect(
-       account='GP21411.us-east-1',
-       user='VISHWASRINIVASAN',
-       private_key=pk_bytes,
-       role='GTMADMIN',
-       warehouse='HUMANS',
-       database='HQ'
-   )
-   
-   cursor = conn.cursor()
-   cursor.execute("YOUR SQL HERE")
-   results = cursor.fetchall()
+3. **For ALL other queries, use generic SQL helper:**
+   ```bash
+   python3 ~/batch-gtm-agents/snowflake_query.py "SELECT ... FROM ... WHERE ..."
    ```
+   
+   Examples:
+   - Gong calls: `python3 ~/batch-gtm-agents/snowflake_query.py "SELECT CALL_TITLE, SCHEDULED_TS, ATTENDEES, FULL_TRANSCRIPT FROM HQ.MODEL_CRM_SENSITIVE.GONG_CALL_TRANSCRIPTS WHERE LOWER(ACCT_NAME) LIKE '%detroit lions%' ORDER BY SCHEDULED_TS DESC LIMIT 5"`
+   - MQL analytics: `python3 ~/batch-gtm-agents/snowflake_query.py "SELECT COUNT(*) as mql_count, REPORTING_CHANNEL FROM HQ.MODEL_CRM.SF_MQLS WHERE MQL_TS >= '2026-01-01' GROUP BY REPORTING_CHANNEL"`
+   - Research data: `python3 ~/batch-gtm-agents/snowflake_query.py "SELECT acct_name, tier, orchestration_mentions FROM GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT WHERE orchestration_mentions > 50 ORDER BY orchestration_mentions DESC LIMIT 10"`
+   
+   **IMPORTANT:** ALWAYS use this helper script. NEVER write inline Python for Snowflake queries.
 
 ## Step 3: Format Output
 

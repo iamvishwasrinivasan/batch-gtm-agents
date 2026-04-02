@@ -1,7 +1,7 @@
 ---
 name: snowflake-gtm-query
-description: Query Snowflake GTM data - accounts, MQLs, calls, research, DAG runs, product usage
-args: Natural language question (e.g., "who MQL'd at Americor" or "show accounts with >100 DAGs")
+description: Query Snowflake GTM data - accounts, MQLs, Gong call transcripts, research, DAG runs, product usage
+args: Natural language question (e.g., "who MQL'd at Americor", "summarize gong calls", "show accounts with >100 DAGs")
 ---
 
 You are answering this Snowflake query: **{{args}}**

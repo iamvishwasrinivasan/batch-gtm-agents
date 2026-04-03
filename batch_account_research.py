@@ -418,6 +418,23 @@ def bulk_fetch_snowflake_context(acct_ids: List[str]) -> Dict[str, AccountContex
         '''.format(placeholders), tuple(acct_ids))
         transcript_rows = cursor.fetchall()
 
+        # Fetch email correspondence from Salesforce
+        cursor.execute('''
+            SELECT
+                o.ACCOUNT_ID,
+                t.ID as email_id,
+                t.SUBJECT,
+                t.CREATED_DATE,
+                LEFT(t.DESCRIPTION, 500) as description_preview
+            FROM IN_SALESFORCE.OPPORTUNITY o
+            INNER JOIN IN_SALESFORCE.TASK t ON o.ID = t.WHAT_ID
+            WHERE o.ACCOUNT_ID IN ({})
+              AND t.TYPE = 'Email'
+            ORDER BY o.ACCOUNT_ID, t.CREATED_DATE DESC
+            LIMIT 1000
+        '''.format(placeholders), tuple(acct_ids))
+        email_rows = cursor.fetchall()
+
         # Group by account_id
         contacts_by_acct = {}
         for row in contact_rows:
@@ -471,7 +488,19 @@ def bulk_fetch_snowflake_context(acct_ids: List[str]) -> Dict[str, AccountContex
                 full_transcript=row[5]
             ))
 
-        log(f"Phase 2: Fetched {len(contact_rows)} contacts, {len(mql_rows)} MQLs, {len(opp_rows)} opps, {len(transcript_rows)} calls")
+        emails_by_acct = {}
+        for row in email_rows:
+            acct_id = row[0]
+            if acct_id not in emails_by_acct:
+                emails_by_acct[acct_id] = []
+            emails_by_acct[acct_id].append({
+                'email_id': row[1],
+                'subject': row[2],
+                'date': row[3].isoformat() if row[3] else None,
+                'preview': row[4]
+            })
+
+        log(f"Phase 2: Fetched {len(contact_rows)} contacts, {len(mql_rows)} MQLs, {len(opp_rows)} opps, {len(transcript_rows)} calls, {len(email_rows)} emails")
 
         cursor.close()
         conn.close()
@@ -479,7 +508,8 @@ def bulk_fetch_snowflake_context(acct_ids: List[str]) -> Dict[str, AccountContex
             'contacts_by_acct': contacts_by_acct,
             'mqls_by_acct': mqls_by_acct,
             'opps_by_acct': opps_by_acct,
-            'transcripts_by_acct': transcripts_by_acct
+            'transcripts_by_acct': transcripts_by_acct,
+            'emails_by_acct': emails_by_acct
         }
 
     except Exception as e:
@@ -527,6 +557,82 @@ def _execute_search_with_retry(
 
     return {'status': 'error', 'error': 'max_retries_exceeded'}
 
+def _claude_web_search_fallback(query: str, company_name: str) -> Dict:
+    """
+    Fallback to Claude API for web search when Exa fails.
+    Uses Claude's extended thinking + web search to gather information.
+    """
+    if not ANTHROPIC_API_KEY:
+        return {'status': 'error', 'error': 'anthropic_api_key_not_set'}
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # Use Claude to perform web search and extract highlights
+        search_prompt = f"""Search the web for: {query}
+
+Extract the most relevant findings about {company_name}. Return your response as a JSON object with this structure:
+{{
+    "results": [
+        {{
+            "title": "result title",
+            "url": "result url",
+            "highlights": ["key point 1", "key point 2", "key point 3"]
+        }}
+    ]
+}}
+
+Focus on factual, specific information. Each highlight should be a complete sentence or fact."""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": search_prompt
+            }]
+        )
+
+        # Parse Claude's response
+        content = response.content[0].text
+
+        # Try to extract JSON from the response
+        try:
+            # Find JSON object in the response
+            start_idx = content.find('{')
+            end_idx = content.rfind('}') + 1
+            if start_idx != -1 and end_idx > start_idx:
+                json_str = content[start_idx:end_idx]
+                data = json.loads(json_str)
+                return {'status': 'success', 'data': data, 'source': 'claude_fallback'}
+            else:
+                # If no JSON found, create a simple structure from the text
+                return {
+                    'status': 'success',
+                    'data': {
+                        'results': [{
+                            'title': f'{company_name} research via Claude',
+                            'highlights': [content[:500]]  # Use first 500 chars as highlight
+                        }]
+                    },
+                    'source': 'claude_fallback'
+                }
+        except json.JSONDecodeError:
+            # If JSON parsing fails, return raw content as highlight
+            return {
+                'status': 'success',
+                'data': {
+                    'results': [{
+                        'title': f'{company_name} research via Claude',
+                        'highlights': [content[:500]]
+                    }]
+                },
+                'source': 'claude_fallback'
+            }
+
+    except Exception as e:
+        return {'status': 'error', 'error': f'claude_fallback_failed: {str(e)}'}
+
 def _search_company_research(
     company_name: str,
     config: ExaSearchConfig,
@@ -556,7 +662,14 @@ def _search_company_research(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for company research, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} company overview business model", company_name)
+
+    return result
 
 def _search_orchestration(
     company_name: str,
@@ -591,7 +704,14 @@ def _search_orchestration(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for orchestration search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
+
+    return result
 
 def _search_hiring(
     company_name: str,
@@ -627,7 +747,14 @@ def _search_hiring(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for hiring search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
+
+    return result
 
 def _search_news(
     company_name: str,
@@ -658,7 +785,14 @@ def _search_news(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for news search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
+
+    return result
 
 def _search_blog_posts(
     company_name: str,
@@ -693,7 +827,14 @@ def _search_blog_posts(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for blog posts search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
+
+    return result
 
 def _search_product_announcements(
     company_name: str,
@@ -728,7 +869,14 @@ def _search_product_announcements(
             timeout=config.timeout_sec
         )
 
-    return _execute_search_with_retry(make_request, config, circuit_breaker)
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
+
+    # Fallback to Claude if Exa fails
+    if result.get('status') != 'success':
+        log(f"[{company_name}] Exa failed for product announcements search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} product launch announcement new feature release", company_name)
+
+    return result
 
 def _search_case_studies(
     company_name: str,
@@ -794,7 +942,9 @@ def _search_case_studies(
             'data': {'results': merged_results}
         }
     else:
-        return result_a  # Return first error
+        # Both Exa queries failed, fallback to Claude
+        log(f"[{company_name}] Exa failed for case studies search, falling back to Claude...")
+        return _claude_web_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
 
 def _crawl_website(
     domain: str,
@@ -1562,6 +1712,13 @@ def research_single_account(
             if acct_id_for_lookup and 'transcripts_by_acct' in sf_context:
                 transcripts = sf_context['transcripts_by_acct'].get(acct_id_for_lookup, [])
 
+        # Extract emails from sf_context if available
+        emails = []
+        if engagement_data and sf_context:
+            acct_id_for_lookup = engagement_data.get('acct_id')
+            if acct_id_for_lookup and 'emails_by_acct' in sf_context:
+                emails = sf_context['emails_by_acct'].get(acct_id_for_lookup, [])
+
         if engagement_data:
             tier, priority = classify_account(engagement_data, sf_context)
             acct_id = engagement_data.get('acct_id')
@@ -1605,9 +1762,11 @@ def research_single_account(
                 'contacts': contact_count,
                 'mqls': mql_count,
                 'opportunities': opp_count,
-                'calls': call_count
+                'calls': call_count,
+                'emails': len(emails)
             },
             'transcripts': transcripts_json,
+            'emails': emails,
             'web_research': exa_result,
             'generated_at': datetime.now().isoformat()
         }
@@ -1629,7 +1788,8 @@ def research_single_account(
                 f.write(f"- **Contacts:** {contact_count}\\n")
                 f.write(f"- **MQLs:** {mql_count}\\n")
                 f.write(f"- **Opportunities:** {opp_count}\\n")
-                f.write(f"- **Gong Calls:** {call_count}\\n\\n")
+                f.write(f"- **Gong Calls:** {call_count}\\n")
+                f.write(f"- **Emails:** {len(emails)}\\n\\n")
 
                 # Add transcripts if available
                 if transcripts:
@@ -1643,6 +1803,20 @@ def research_single_account(
                             # Truncate very long transcripts in markdown
                             transcript_preview = t.full_transcript[:2000] + "..." if len(t.full_transcript) > 2000 else t.full_transcript
                             f.write(f"**Transcript:**\\n\\n{transcript_preview}\\n\\n")
+                        f.write(f"---\\n\\n")
+
+                # Add emails if available
+                if emails:
+                    f.write(f"## Email Correspondence\\n\\n")
+                    for e in emails[:20]:  # Show up to 20 most recent emails
+                        date_str = e.get('date', 'N/A')
+                        if date_str != 'N/A':
+                            date_str = date_str[:10]  # Just the date part (YYYY-MM-DD)
+                        subject = e.get('subject', '(no subject)')
+                        preview = e.get('preview', '')
+                        f.write(f"### {date_str} - {subject}\\n\\n")
+                        if preview:
+                            f.write(f"{preview}\\n\\n")
                         f.write(f"---\\n\\n")
 
             f.write(f"## Web Research Signals\\n\\n")
@@ -1776,9 +1950,67 @@ def save_to_snowflake(results: List[ResearchResult]):
             structured_signals = getattr(result, 'structured_signals', None)
             structured_tech_stack = getattr(result, 'structured_tech_stack', None)
 
-            # Use INSERT INTO ... SELECT with PARSE_JSON to convert strings to ARRAY
+            # Extract emails from the JSON file
+            email_correspondence_json = None
+            if result.report_json_path and Path(result.report_json_path).exists():
+                try:
+                    with open(result.report_json_path, 'r') as f:
+                        report_data = json.load(f)
+                        emails = report_data.get('emails', [])
+                        if emails:
+                            email_correspondence_json = json.dumps(emails)
+                except Exception as e:
+                    log(f"Warning: Could not read emails from {result.report_json_path}: {e}")
+
+            # MERGE on acct_name to avoid duplicate rows on re-runs
             cursor.execute('''
-            INSERT INTO ACCOUNT_RESEARCH_OUTPUT (
+            MERGE INTO ACCOUNT_RESEARCH_OUTPUT tgt
+            USING (
+                SELECT
+                    %s AS acct_id, %s AS acct_name, %s AS tier, %s AS priority_score,
+                    %s AS has_sf_context, %s AS contact_count, %s AS mql_count,
+                    %s AS opp_count, %s AS call_count,
+                    %s AS latest_mql_date, %s AS latest_call_date,
+                    PARSE_JSON(%s) AS key_signals, PARSE_JSON(%s) AS tech_stack,
+                    %s AS report_json_path,
+                    %s AS processing_time_sec, %s AS status, %s AS error_message,
+                    %s AS orchestration_mentions, %s AS hiring_signals_count,
+                    %s AS blog_post_count, %s AS product_announcement_count,
+                    %s AS case_study_count, %s AS website_crawled,
+                    %s AS job_descriptions_crawled,
+                    %s AS exa_search_time_sec, %s AS exa_searches_completed,
+                    %s AS exa_searches_failed,
+                    %s AS comprehensive_report,
+                    %s AS structured_signals, %s AS structured_tech_stack,
+                    %s AS email_correspondence
+            ) src ON tgt.acct_name = src.acct_name
+            WHEN MATCHED THEN UPDATE SET
+                acct_id = src.acct_id, tier = src.tier,
+                priority_score = src.priority_score,
+                has_sf_context = src.has_sf_context,
+                contact_count = src.contact_count, mql_count = src.mql_count,
+                opp_count = src.opp_count, call_count = src.call_count,
+                latest_mql_date = src.latest_mql_date,
+                latest_call_date = src.latest_call_date,
+                key_signals = src.key_signals, tech_stack = src.tech_stack,
+                report_json_path = src.report_json_path,
+                processing_time_sec = src.processing_time_sec,
+                status = src.status, error_message = src.error_message,
+                orchestration_mentions = src.orchestration_mentions,
+                hiring_signals_count = src.hiring_signals_count,
+                blog_post_count = src.blog_post_count,
+                product_announcement_count = src.product_announcement_count,
+                case_study_count = src.case_study_count,
+                website_crawled = src.website_crawled,
+                job_descriptions_crawled = src.job_descriptions_crawled,
+                exa_search_time_sec = src.exa_search_time_sec,
+                exa_searches_completed = src.exa_searches_completed,
+                exa_searches_failed = src.exa_searches_failed,
+                comprehensive_report = src.comprehensive_report,
+                structured_signals = src.structured_signals,
+                structured_tech_stack = src.structured_tech_stack,
+                email_correspondence = src.email_correspondence
+            WHEN NOT MATCHED THEN INSERT (
                 acct_id, acct_name, tier, priority_score,
                 has_sf_context, contact_count, mql_count, opp_count, call_count,
                 latest_mql_date, latest_call_date,
@@ -1788,20 +2020,25 @@ def save_to_snowflake(results: List[ResearchResult]):
                 product_announcement_count, case_study_count,
                 website_crawled, job_descriptions_crawled,
                 exa_search_time_sec, exa_searches_completed, exa_searches_failed,
-                comprehensive_report,
-                structured_signals, structured_tech_stack
+                comprehensive_report, structured_signals, structured_tech_stack,
+                email_correspondence
+            ) VALUES (
+                src.acct_id, src.acct_name, src.tier, src.priority_score,
+                src.has_sf_context, src.contact_count, src.mql_count,
+                src.opp_count, src.call_count,
+                src.latest_mql_date, src.latest_call_date,
+                src.key_signals, src.tech_stack, src.report_json_path,
+                src.processing_time_sec, src.status, src.error_message,
+                src.orchestration_mentions, src.hiring_signals_count,
+                src.blog_post_count, src.product_announcement_count,
+                src.case_study_count, src.website_crawled,
+                src.job_descriptions_crawled,
+                src.exa_search_time_sec, src.exa_searches_completed,
+                src.exa_searches_failed,
+                src.comprehensive_report, src.structured_signals,
+                src.structured_tech_stack,
+                src.email_correspondence
             )
-            SELECT
-                %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s,
-                PARSE_JSON(%s), PARSE_JSON(%s), %s,
-                %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s,
-                %s, %s, %s,
-                %s,
-                %s, %s
             ''', (
                 result.acct_id, result.acct_name, result.tier, result.priority_score,
                 result.has_sf_context, result.contact_count, result.mql_count,
@@ -1821,7 +2058,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 exa_metadata.get('searches_failed', 0),
                 comprehensive_report,
                 structured_signals,
-                structured_tech_stack
+                structured_tech_stack,
+                email_correspondence_json
             ))
             log(f"✓ Saved {result.acct_name} to Snowflake")
         except Exception as e:
@@ -1840,10 +2078,10 @@ def batch_research(account_list: List[str]) -> List[ResearchResult]:
     """
     log(f"Starting batch research for {len(account_list)} accounts...")
 
-    # Create shared rate limiter, config, and circuit breaker for entire batch
+    # Create shared rate limiter and config for entire batch
+    # Circuit breaker is per-account so failures in one don't cascade to others
     rate_limiter = RateLimiter(rate_per_minute=60, burst=15)  # Conservative for free tier
     exa_config = ExaSearchConfig()
-    circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60)
 
     # Phase 1: Bulk engagement check
     engagement_map = bulk_check_engagement(account_list)
@@ -1874,7 +2112,7 @@ def batch_research(account_list: List[str]) -> List[ResearchResult]:
                 sf_context,
                 rate_limiter,  # Shared across all accounts
                 exa_config,
-                circuit_breaker
+                CircuitBreaker(failure_threshold=5, timeout=60)  # Per-account isolation
             )] = account_name
 
         for future in as_completed(futures):

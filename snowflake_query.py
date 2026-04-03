@@ -6,6 +6,7 @@ Usage: python3 snowflake_query.py "SELECT * FROM table LIMIT 5"
 
 import sys
 import json
+import decimal
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -56,6 +57,9 @@ def run_query(sql: str) -> dict:
                 # Convert datetime to ISO string
                 if hasattr(val, 'isoformat'):
                     val = val.isoformat()
+                # Convert Decimal to float
+                elif isinstance(val, decimal.Decimal):
+                    val = float(val)
                 row_dict[col] = val
             results.append(row_dict)
 

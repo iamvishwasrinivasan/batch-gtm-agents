@@ -1,7 +1,7 @@
 ---
 name: batch-account-research
 description: Run comprehensive account research - Exa searches, Snowflake CRM data, Gong transcripts, email correspondence. Saves to Snowflake and generates i360-style reports.
-args: Company names (comma-separated) or "--accounts-file path/to/file.txt" (e.g., "Apollo,Grindr,Quickbase")
+args: Company names (comma-separated) or "--accounts-file path/to/file.txt" with optional "--tag play_name" (e.g., "Apollo,Grindr,Quickbase --tag Q2_enterprise")
 ---
 
 You are running batch account research for: **{{args}}**
@@ -12,16 +12,22 @@ Runs comprehensive account research pipeline:
 1. **9 Exa searches per account** - orchestration tools, hiring, news, blog posts, case studies, website crawl
 2. **Snowflake CRM context** - contacts, MQLs, opportunities, Gong call transcripts, email correspondence
 3. **Airflow Mission Critical grading** - A/B/C/D assessment of Airflow criticality
-4. **Saves to Snowflake** - `GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT`
+4. **Saves to Snowflake** - `GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT` with optional batch_tag
 5. **Optional reports** - i360-style comprehensive reports (if ANTHROPIC_API_KEY set)
 
 # Execution
 
 Parse args to determine invocation:
 
-## If comma-separated company names:
+## If comma-separated company names (with optional tag):
 ```bash
 cd /Users/vishwasrinivasan/batch-gtm-agents && python3 batch_account_research.py --accounts "{{args}}"
+```
+
+## If args contain "--tag":
+Extract tag and pass it through:
+```bash
+cd /Users/vishwasrinivasan/batch-gtm-agents && python3 batch_account_research.py --accounts "CompanyA,CompanyB" --tag "play_name"
 ```
 
 ## If args start with "--accounts-file":
@@ -66,6 +72,7 @@ After completion, summarize:
 - Query results: `python3 ~/batch-gtm-agents/query_account.py "CompanyA"`
 - See all high-signal accounts: `/snowflake-gtm-query accounts with >20 orchestration mentions`
 - Check email history: `/snowflake-gtm-query show emails for CompanyA`
+- Query by tag: `SELECT * FROM GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT WHERE batch_tag = 'your_tag'`
 ```
 
 If any accounts failed, list them with error messages.
@@ -78,6 +85,7 @@ If any accounts failed, list them with error messages.
 - contact_count, mql_count, opp_count, call_count
 - latest_mql_date, latest_call_date
 - **email_correspondence** (JSON array) - Salesforce Task emails with subject, date, preview
+- **batch_tag** (VARCHAR) - optional tag for grouping research batches by play/campaign
 
 **Signals:**
 - orchestration_mentions (Airflow/Dagster/Prefect references)
@@ -162,10 +170,18 @@ Error: Column 'email_correspondence' does not exist
 → Get fresh research + email history for tomorrow's meetings
 ```
 
-**Conference attendees:**
+**Conference attendees (with tag for later querying):**
 ```
-/batch-account-research --accounts-file ~/Downloads/dreamforce_leads.txt
-→ Research all leads from event
+/batch-account-research --accounts-file ~/Downloads/dreamforce_leads.txt --tag dreamforce_2026
+→ Research all leads from event, tag for later analysis
+→ Query: SELECT * FROM GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT WHERE batch_tag = 'dreamforce_2026'
+```
+
+**Sales play targeting (tag by campaign):**
+```
+/batch-account-research CompanyA,CompanyB,CompanyC --tag Q2_enterprise_outreach
+→ Tag accounts by sales play
+→ Query: SELECT * FROM GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT WHERE batch_tag = 'Q2_enterprise_outreach' AND orchestration_mentions > 20
 ```
 
 **Deal post-mortem:**

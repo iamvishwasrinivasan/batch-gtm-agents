@@ -37,6 +37,7 @@ import anthropic
 # --- Config ---
 SNOWFLAKE_CONFIG = Path.home() / ".snowflake/service_config.yaml"
 EXA_API_KEY = os.getenv("EXA_API_KEY")
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OUTPUT_DIR = Path.home() / "claude-work/batch-research-output"
 SNOWFLAKE_TABLE = "GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT"
@@ -116,6 +117,7 @@ class ResearchResult:
     comprehensive_report: Optional[str] = None  # v2: i360-style comprehensive report
     structured_signals: Optional[str] = None  # v2: Full structured signals as JSON text
     structured_tech_stack: Optional[str] = None  # v2: Full tech stack with confidence as JSON text
+    batch_tag: Optional[str] = None  # Tag for grouping research batches
 
 # --- Exa v2 Infrastructure ---
 
@@ -633,6 +635,60 @@ Focus on factual, specific information. Each highlight should be a complete sent
     except Exception as e:
         return {'status': 'error', 'error': f'claude_fallback_failed: {str(e)}'}
 
+def _brave_search_fallback(query: str, company_name: str) -> Dict:
+    """
+    Fallback to Brave Search API when Exa fails.
+    Uses Brave Web Search to gather information.
+    """
+    if not BRAVE_API_KEY:
+        return {'status': 'error', 'error': 'brave_api_key_not_set'}
+
+    try:
+        headers = {
+            "X-Subscription-Token": BRAVE_API_KEY,
+            "Accept": "application/json"
+        }
+
+        params = {
+            "q": query,
+            "count": 5,  # Number of results
+            "text_decorations": False,
+            "search_lang": "en"
+        }
+
+        response = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params=params,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            return {'status': 'error', 'error': f'brave_http_{response.status_code}'}
+
+        data = response.json()
+
+        # Transform Brave results to match Exa format
+        results = []
+        if 'web' in data and 'results' in data['web']:
+            for result in data['web']['results'][:5]:
+                results.append({
+                    'title': result.get('title', ''),
+                    'url': result.get('url', ''),
+                    'highlights': [result.get('description', '')]
+                })
+
+        return {
+            'status': 'success',
+            'data': {
+                'results': results
+            },
+            'source': 'brave_fallback'
+        }
+
+    except Exception as e:
+        return {'status': 'error', 'error': f'brave_fallback_failed: {str(e)}'}
+
 def _search_company_research(
     company_name: str,
     config: ExaSearchConfig,
@@ -641,6 +697,10 @@ def _search_company_research(
 ) -> Dict:
     """Search 1: Company research overview"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} company overview business model", company_name)
 
     headers = {
         "x-api-key": EXA_API_KEY,
@@ -664,10 +724,10 @@ def _search_company_research(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for company research, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} company overview business model", company_name)
+        log(f"[{company_name}] Exa failed for company research, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} company overview business model", company_name)
 
     return result
 
@@ -679,6 +739,10 @@ def _search_orchestration(
 ) -> Dict:
     """Search 2: Orchestration evidence (Airflow, Dagster, Prefect)"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
 
     # Calculate date filter (12 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.orchestration_months_back)).strftime('%Y-%m-%d')
@@ -706,10 +770,10 @@ def _search_orchestration(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for orchestration search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
+        log(f"[{company_name}] Exa failed for orchestration search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
 
     return result
 
@@ -721,6 +785,10 @@ def _search_hiring(
 ) -> Dict:
     """Search 3: Hiring signals (data engineer, platform engineer jobs)"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
 
     # Calculate date filter (6 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.hiring_months_back)).strftime('%Y-%m-%d')
@@ -749,10 +817,10 @@ def _search_hiring(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for hiring search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
+        log(f"[{company_name}] Exa failed for hiring search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
 
     return result
 
@@ -764,6 +832,10 @@ def _search_news(
 ) -> Dict:
     """Search 4: Recent news and corporate strategy"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
 
     headers = {
         "x-api-key": EXA_API_KEY,
@@ -787,10 +859,10 @@ def _search_news(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for news search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
+        log(f"[{company_name}] Exa failed for news search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
 
     return result
 
@@ -802,6 +874,10 @@ def _search_blog_posts(
 ) -> Dict:
     """Search 5: Engineering blog posts about data infrastructure"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
 
     # Calculate date filter (18 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.blog_months_back)).strftime('%Y-%m-%d')
@@ -829,10 +905,10 @@ def _search_blog_posts(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for blog posts search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
+        log(f"[{company_name}] Exa failed for blog posts search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
 
     return result
 
@@ -844,6 +920,10 @@ def _search_product_announcements(
 ) -> Dict:
     """Search 6: Product launches and announcements"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} product launch announcement new feature release", company_name)
 
     # Calculate date filter (12 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.product_months_back)).strftime('%Y-%m-%d')
@@ -871,10 +951,10 @@ def _search_product_announcements(
 
     result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Fallback to Claude if Exa fails
+    # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for product announcements search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} product launch announcement new feature release", company_name)
+        log(f"[{company_name}] Exa failed for product announcements search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} product launch announcement new feature release", company_name)
 
     return result
 
@@ -886,6 +966,10 @@ def _search_case_studies(
 ) -> Dict:
     """Search 7: Case studies and customer stories (2 queries merged)"""
     rate_limiter.acquire()
+
+    # Use Brave if Exa key not available
+    if not EXA_API_KEY:
+        return _brave_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
 
     headers = {
         "x-api-key": EXA_API_KEY,
@@ -942,9 +1026,9 @@ def _search_case_studies(
             'data': {'results': merged_results}
         }
     else:
-        # Both Exa queries failed, fallback to Claude
-        log(f"[{company_name}] Exa failed for case studies search, falling back to Claude...")
-        return _claude_web_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
+        # Both Exa queries failed, fallback to Brave
+        log(f"[{company_name}] Exa failed for case studies search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
 
 def _crawl_website(
     domain: str,
@@ -1314,6 +1398,7 @@ def fetch_exa_research_v2(
 ) -> ExaResearchResult:
     """
     Execute comprehensive 9-search Exa research pattern.
+    Falls back to Brave Search if EXA_API_KEY not configured.
 
     Returns ExaResearchResult with:
     - Top 20 structured signals with metadata
@@ -1321,13 +1406,13 @@ def fetch_exa_research_v2(
     - Full search results per type
     - Timing and completion metadata
     """
-    if not EXA_API_KEY:
+    if not EXA_API_KEY and not BRAVE_API_KEY:
         return ExaResearchResult(
             status='failed',
             key_signals=[],
             tech_stack=[],
             search_results={},
-            metadata={'error': 'EXA_API_KEY not configured'}
+            metadata={'error': 'Neither EXA_API_KEY nor BRAVE_API_KEY configured'}
         )
 
     # Initialize config and rate limiter
@@ -1399,7 +1484,10 @@ def fetch_exa_research_v2(
                     except Exception as e:
                         job_crawls.append({'status': 'error', 'error': str(e)})
 
-                search_results['job_descriptions'] = job_crawls
+                search_results['job_descriptions'] = {
+                    'status': 'success',
+                    'data': job_crawls
+                }
 
     # Aggregate results
     log(f"[{company_name}] Aggregating signals and tech stack...")
@@ -1674,7 +1762,8 @@ def research_single_account(
     sf_context: Optional[dict],
     rate_limiter: Optional[RateLimiter] = None,
     exa_config: Optional[ExaSearchConfig] = None,
-    circuit_breaker: Optional[CircuitBreaker] = None
+    circuit_breaker: Optional[CircuitBreaker] = None,
+    batch_tag: Optional[str] = None
 ) -> ResearchResult:
     """
     Phase 3: Research single account with web + conditional Snowflake enrichment.
@@ -1873,7 +1962,8 @@ def research_single_account(
             exa_metadata=exa_v2_result.metadata,  # v2: Enhanced metadata
             comprehensive_report=comprehensive_report,  # v2: i360-style report
             structured_signals=structured_signals_json,  # v2: Full structured signals
-            structured_tech_stack=structured_tech_stack_json  # v2: Full tech stack with confidence
+            structured_tech_stack=structured_tech_stack_json,  # v2: Full tech stack with confidence
+            batch_tag=batch_tag  # Tag for this research batch
         )
 
     except Exception as e:
@@ -1900,7 +1990,8 @@ def research_single_account(
             exa_metadata=None,
             comprehensive_report=None,
             structured_signals=None,
-            structured_tech_stack=None
+            structured_tech_stack=None,
+            batch_tag=batch_tag
         )
 
 # --- Save to Snowflake ---
@@ -1982,7 +2073,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                     %s AS exa_searches_failed,
                     %s AS comprehensive_report,
                     %s AS structured_signals, %s AS structured_tech_stack,
-                    %s AS email_correspondence
+                    %s AS email_correspondence,
+                    %s AS batch_tag
             ) src ON tgt.acct_name = src.acct_name
             WHEN MATCHED THEN UPDATE SET
                 acct_id = src.acct_id, tier = src.tier,
@@ -2009,7 +2101,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 comprehensive_report = src.comprehensive_report,
                 structured_signals = src.structured_signals,
                 structured_tech_stack = src.structured_tech_stack,
-                email_correspondence = src.email_correspondence
+                email_correspondence = src.email_correspondence,
+                batch_tag = src.batch_tag
             WHEN NOT MATCHED THEN INSERT (
                 acct_id, acct_name, tier, priority_score,
                 has_sf_context, contact_count, mql_count, opp_count, call_count,
@@ -2021,7 +2114,7 @@ def save_to_snowflake(results: List[ResearchResult]):
                 website_crawled, job_descriptions_crawled,
                 exa_search_time_sec, exa_searches_completed, exa_searches_failed,
                 comprehensive_report, structured_signals, structured_tech_stack,
-                email_correspondence
+                email_correspondence, batch_tag
             ) VALUES (
                 src.acct_id, src.acct_name, src.tier, src.priority_score,
                 src.has_sf_context, src.contact_count, src.mql_count,
@@ -2037,7 +2130,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 src.exa_searches_failed,
                 src.comprehensive_report, src.structured_signals,
                 src.structured_tech_stack,
-                src.email_correspondence
+                src.email_correspondence,
+                src.batch_tag
             )
             ''', (
                 result.acct_id, result.acct_name, result.tier, result.priority_score,
@@ -2059,7 +2153,8 @@ def save_to_snowflake(results: List[ResearchResult]):
                 comprehensive_report,
                 structured_signals,
                 structured_tech_stack,
-                email_correspondence_json
+                email_correspondence_json,
+                result.batch_tag
             ))
             log(f"✓ Saved {result.acct_name} to Snowflake")
         except Exception as e:
@@ -2072,11 +2167,13 @@ def save_to_snowflake(results: List[ResearchResult]):
 
 # --- Main Batch Research ---
 
-def batch_research(account_list: List[str]) -> List[ResearchResult]:
+def batch_research(account_list: List[str], batch_tag: Optional[str] = None) -> List[ResearchResult]:
     """
     Main entry point: Three-phase batch research with v2 comprehensive Exa.
     """
     log(f"Starting batch research for {len(account_list)} accounts...")
+    if batch_tag:
+        log(f"Batch tag: {batch_tag}")
 
     # Create shared rate limiter and config for entire batch
     # Circuit breaker is per-account so failures in one don't cascade to others
@@ -2112,7 +2209,8 @@ def batch_research(account_list: List[str]) -> List[ResearchResult]:
                 sf_context,
                 rate_limiter,  # Shared across all accounts
                 exa_config,
-                CircuitBreaker(failure_threshold=5, timeout=60)  # Per-account isolation
+                CircuitBreaker(failure_threshold=5, timeout=60),  # Per-account isolation
+                batch_tag  # Pass tag to each account
             )] = account_name
 
         for future in as_completed(futures):
@@ -2128,6 +2226,8 @@ def batch_research(account_list: List[str]) -> List[ResearchResult]:
     save_to_snowflake(results)
 
     log(f"\\n✅ Completed {len(results)}/{len(account_list)} accounts")
+    if batch_tag:
+        log(f"Query this batch: SELECT * FROM GTM.PUBLIC.ACCOUNT_RESEARCH_OUTPUT WHERE batch_tag = '{batch_tag}'")
     return results
 
 # --- CLI ---
@@ -2136,6 +2236,7 @@ def main():
     parser = argparse.ArgumentParser(description="Batch Account Research")
     parser.add_argument('--accounts', type=str, help='Comma-separated list of account names')
     parser.add_argument('--accounts-file', type=str, help='File containing account names (one per line)')
+    parser.add_argument('--tag', type=str, help='Optional tag to label this batch (e.g., "Q2_enterprise", "dreamforce_leads")')
 
     args = parser.parse_args()
 
@@ -2150,7 +2251,7 @@ def main():
         sys.exit(1)
 
     # Run batch research
-    results = batch_research(account_list)
+    results = batch_research(account_list, batch_tag=args.tag)
 
     # Summary
     print("\\n=== Summary ===")

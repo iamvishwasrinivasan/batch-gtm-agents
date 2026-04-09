@@ -1108,9 +1108,78 @@ def _extract_job_urls_from_hiring_results(hiring_result: Dict, max_urls: int = 2
 
 # Exa v2: Signal and Tech Stack Aggregation
 
+def _is_signal_valid(signal_text: str, url: str, company_name: str) -> tuple:
+    """
+    Validate if a signal is actually about the company.
+
+    Returns: (is_valid: bool, reason: str)
+    """
+    signal_lower = signal_text.lower()
+    url_lower = url.lower()
+    company_lower = company_name.lower()
+
+    # Extract company domain (e.g., "Smith Gardens" -> "smithgardens")
+    company_domain = ''.join(company_name.lower().split())
+
+    # BLOCKLIST: Filter out obvious garbage
+    garbage_domains = [
+        'amazon.com',
+        'linkedin.com/jobs',
+        'indeed.com',
+        'glassdoor.com',
+        'github.com/gist',
+        'stackoverflow.com',
+        'reddit.com',
+        'medium.com/@',
+        'dev.to'
+    ]
+
+    garbage_phrases = [
+        'click the button below',
+        'continue shopping',
+        'conditions of use',
+        'privacy policy',
+        '© 1996-2025',
+        'any time (5,',
+        'past month (',
+        'past week (',
+        'job type',
+        'full-time (',
+        'part-time ('
+    ]
+
+    # Check for garbage
+    for domain in garbage_domains:
+        if domain in url_lower:
+            return (False, f"garbage_domain:{domain}")
+
+    for phrase in garbage_phrases:
+        if phrase in signal_lower:
+            return (False, f"garbage_phrase:{phrase[:20]}")
+
+    # Filter out too-generic content
+    if len(signal_text) < 50:
+        return (False, "too_short")
+
+    # Check if signal is about the company
+    # Accept if: company name in text OR company domain in URL
+    company_in_text = company_lower in signal_lower
+    company_in_url = company_domain in url_lower
+
+    if company_in_text or company_in_url:
+        return (True, "verified")
+
+    # Special case: Website crawl results are always valid (they're from company site)
+    if company_domain in url_lower and any(ext in url_lower for ext in ['.com', '.io', '.co', '.net']):
+        return (True, "company_domain")
+
+    return (False, "no_company_mention")
+
 def _aggregate_signals(search_results: Dict, company_name: str) -> List[Dict]:
     """
     Extract and score top 20 signals from all searches.
+
+    NOW WITH VALIDATION: Filters out garbage and non-company-specific results.
 
     Signal scoring priority (1-10):
     - Orchestration mentions: 9
@@ -1123,6 +1192,8 @@ def _aggregate_signals(search_results: Dict, company_name: str) -> List[Dict]:
     - Company research: 3
     """
     signals = []
+    filtered_count = 0
+    filter_reasons = {}
 
     # Define score by source
     source_scores = {
@@ -1152,28 +1223,41 @@ def _aggregate_signals(search_results: Dict, company_name: str) -> List[Dict]:
                     job_data = job_result.get('data', {})
                     for item in job_data.get('results', []):
                         text = item.get('text', '')[:300]
+                        url = item.get('url', '')
+
                         if text:
-                            signals.append({
-                                'signal': text,
-                                'source': 'job_description',
-                                'url': item.get('url', ''),
-                                'date': None,
-                                'score': 9,
-                                'category': 'hiring_evidence'
-                            })
+                            # VALIDATION: Check if signal is valid
+                            is_valid, reason = _is_signal_valid(text, url, company_name)
+                            if is_valid:
+                                signals.append({
+                                    'signal': text,
+                                    'source': 'job_description',
+                                    'url': url,
+                                    'date': None,
+                                    'score': 9,
+                                    'category': 'hiring_evidence',
+                                    'verified': True
+                                })
+                            else:
+                                filtered_count += 1
+                                filter_reasons[reason] = filter_reasons.get(reason, 0) + 1
+
         elif search_type in ['website_crawl']:
-            # Content crawl results
+            # Content crawl results (always valid - from company domain)
             data = result.get('data', {})
             for item in data.get('results', []):
                 text = item.get('text', '')[:300]
-                if text:
+                url = item.get('url', '')
+
+                if text and len(text) > 50:  # Basic length check
                     signals.append({
                         'signal': text,
                         'source': search_type,
-                        'url': item.get('url', ''),
+                        'url': url,
                         'date': None,
                         'score': score,
-                        'category': 'company_info'
+                        'category': 'company_info',
+                        'verified': True  # Website crawl is always verified
                     })
         else:
             # Search results with highlights
@@ -1185,17 +1269,34 @@ def _aggregate_signals(search_results: Dict, company_name: str) -> List[Dict]:
 
                 for highlight in highlights[:2]:  # Top 2 highlights per result
                     if highlight and len(highlight) > 20:
-                        signals.append({
-                            'signal': highlight[:300],
-                            'source': search_type,
-                            'url': url,
-                            'date': published_date,
-                            'score': score,
-                            'category': _categorize_signal(search_type, highlight)
-                        })
+                        # VALIDATION: Check if signal is valid
+                        is_valid, reason = _is_signal_valid(highlight, url, company_name)
+
+                        if is_valid:
+                            signals.append({
+                                'signal': highlight[:300],
+                                'source': search_type,
+                                'url': url,
+                                'date': published_date,
+                                'score': score,
+                                'category': _categorize_signal(search_type, highlight),
+                                'verified': True
+                            })
+                        else:
+                            filtered_count += 1
+                            filter_reasons[reason] = filter_reasons.get(reason, 0) + 1
 
     # Sort by score descending, then by date (most recent first)
     signals.sort(key=lambda s: (s['score'], s['date'] or ''), reverse=True)
+
+    # Log data quality metrics
+    if filtered_count > 0:
+        print(f"    [Validation] Filtered {filtered_count} irrelevant signals:")
+        for reason, count in sorted(filter_reasons.items(), key=lambda x: x[1], reverse=True):
+            print(f"      - {reason}: {count}")
+
+    verified_signals = [s for s in signals if s.get('verified', False)]
+    print(f"    [Quality] {len(verified_signals)} verified signals, {filtered_count} filtered")
 
     return signals[:20]  # Top 20 signals
 
@@ -1218,9 +1319,10 @@ def _categorize_signal(search_type: str, text: str) -> str:
     else:
         return 'general'
 
-def _aggregate_tech_stack(search_results: Dict) -> List[Dict]:
+def _aggregate_tech_stack(validated_signals: List[Dict]) -> List[Dict]:
     """
     Extract and deduplicate technology mentions with confidence scores.
+    NOW ONLY USES VALIDATED SIGNALS - no garbage data.
 
     Source reliability (0.0-1.0):
     - Job descriptions: 1.0
@@ -1248,7 +1350,7 @@ def _aggregate_tech_stack(search_results: Dict) -> List[Dict]:
 
     # Source weights
     source_weights = {
-        'job_descriptions': 1.0,
+        'job_description': 1.0,
         'orchestration': 0.9,
         'blog_posts': 0.8,
         'case_studies': 0.8,
@@ -1262,35 +1364,20 @@ def _aggregate_tech_stack(search_results: Dict) -> List[Dict]:
     # Track mentions: {tech: {category, sources, weighted_count}}
     tech_mentions = {}
 
-    # Scan all search results
-    for search_type, result in search_results.items():
-        if result.get('status') != 'success':
-            continue
+    # Scan ONLY validated signals
+    for signal in validated_signals:
+        signal_text = signal.get('signal', '')
+        source_type = signal.get('source', 'unknown')
+        weight = source_weights.get(source_type, 0.3)
 
-        weight = source_weights.get(search_type, 0.3)
-
-        # Extract text from results
-        all_text = ''
-        if search_type == 'job_descriptions':
-            for job_result in result.get('data', []):
-                if isinstance(job_result, dict) and job_result.get('status') == 'success':
-                    job_data = job_result.get('data', {})
-                    for item in job_data.get('results', []):
-                        all_text += ' ' + item.get('text', '')
-        else:
-            data = result.get('data', {})
-            for item in data.get('results', []):
-                all_text += ' ' + ' '.join(item.get('highlights', []))
-                all_text += ' ' + item.get('text', '')
-
-        all_text_lower = all_text.lower()
+        signal_text_lower = signal_text.lower()
 
         # Match against tech catalog
         for category, techs in TECH_CATALOG.items():
             for tech in techs:
-                if tech.lower() in all_text_lower:
+                if tech.lower() in signal_text_lower:
                     # Count occurrences
-                    count = all_text_lower.count(tech.lower())
+                    count = signal_text_lower.count(tech.lower())
                     weighted_count = count * weight
 
                     if tech not in tech_mentions:
@@ -1301,7 +1388,8 @@ def _aggregate_tech_stack(search_results: Dict) -> List[Dict]:
                             'mention_count': 0
                         }
 
-                    tech_mentions[tech]['sources'].append(search_type)
+                    if source_type not in tech_mentions[tech]['sources']:
+                        tech_mentions[tech]['sources'].append(source_type)
                     tech_mentions[tech]['weighted_count'] += weighted_count
                     tech_mentions[tech]['mention_count'] += count
 
@@ -1492,7 +1580,7 @@ def fetch_exa_research_v2(
     # Aggregate results
     log(f"[{company_name}] Aggregating signals and tech stack...")
     key_signals = _aggregate_signals(search_results, company_name)
-    tech_stack = _aggregate_tech_stack(search_results)
+    tech_stack = _aggregate_tech_stack(key_signals)  # Use validated signals only
 
     # Build metadata
     elapsed = time.time() - start_time

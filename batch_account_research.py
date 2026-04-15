@@ -118,6 +118,10 @@ class ResearchResult:
     structured_signals: Optional[str] = None  # v2: Full structured signals as JSON text
     structured_tech_stack: Optional[str] = None  # v2: Full tech stack with confidence as JSON text
     batch_tag: Optional[str] = None  # Tag for grouping research batches
+    tech_stack_from_jobs: Optional[str] = None  # v2: Tech stack extracted from job postings as JSON text
+    classification: Optional[str] = None  # v2: Account classification (CUSTOMER, ENGAGED PROSPECT, etc.)
+    airflow_signals: Optional[List[str]] = None  # v2: Array of Airflow detection signals
+    has_airflow_signal: Optional[bool] = None  # v2: Boolean flag for Airflow detection
 
 # --- Exa v2 Infrastructure ---
 
@@ -331,7 +335,7 @@ def bulk_check_engagement(account_list: List[str]) -> Dict[str, dict]:
                     break
 
             if matched_user_name:
-                engagement_map[matched_user_name] = {
+                new_data = {
                     'acct_id': row[0],
                     'acct_name': row[1],
                     'acct_type': row[2],
@@ -346,6 +350,21 @@ def bulk_check_engagement(account_list: List[str]) -> Dict[str, dict]:
                     'latest_call_date': row[11],
                     'has_engagement': row[7] > 0 or row[9] > 0  # has MQLs or calls
                 }
+
+                # If duplicate, prioritize: 1) customers over prospects, 2) more engagement
+                if matched_user_name in engagement_map:
+                    existing = engagement_map[matched_user_name]
+                    # Prioritize customer accounts
+                    if new_data['is_current_cust'] and not existing['is_current_cust']:
+                        engagement_map[matched_user_name] = new_data
+                    # If both same customer status, prioritize more engagement
+                    elif new_data['is_current_cust'] == existing['is_current_cust']:
+                        new_engagement = new_data['call_count'] + new_data['mql_count']
+                        existing_engagement = existing['call_count'] + existing['mql_count']
+                        if new_engagement > existing_engagement:
+                            engagement_map[matched_user_name] = new_data
+                else:
+                    engagement_map[matched_user_name] = new_data
 
         engaged_count = sum(1 for data in engagement_map.values() if data['has_engagement'])
         log(f"Phase 1: Found {len(engagement_map)} accounts in Snowflake, {engaged_count} with MQLs/calls")
@@ -731,32 +750,32 @@ def _search_company_research(
 
     return result
 
-def _search_orchestration(
+def _search_github_evidence(
     company_name: str,
     config: ExaSearchConfig,
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker
 ) -> Dict:
-    """Search 2: Orchestration evidence (Airflow, Dagster, Prefect)"""
+    """Search 2: GitHub evidence - actual code repos, not generic articles"""
     rate_limiter.acquire()
 
     # Use Brave if Exa key not available
     if not EXA_API_KEY:
-        return _brave_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
+        return _brave_search_fallback(f"{company_name} github airflow dags workflows", company_name)
 
-    # Calculate date filter (12 months back)
-    start_date = (datetime.now() - timedelta(days=30 * config.orchestration_months_back)).strftime('%Y-%m-%d')
+    # Try to derive GitHub slug from company name
+    company_slug = company_name.lower().replace(' ', '-').replace('.', '')
 
     headers = {
         "x-api-key": EXA_API_KEY,
         "Content-Type": "application/json"
     }
 
+    # Search for GitHub repos with orchestration evidence
     payload = {
-        "query": f"{company_name} data pipeline orchestration airflow dagster prefect",
+        "query": f'site:github.com/{company_slug} OR site:github.com "{company_name}" (airflow OR dags OR workflows OR kubernetes OR terraform OR infrastructure)',
         "numResults": 5,
         "type": "keyword",
-        "startPublishedDate": start_date,
         "contents": {"highlights": True}
     }
 
@@ -772,8 +791,8 @@ def _search_orchestration(
 
     # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for orchestration search, falling back to Brave Search...")
-        return _brave_search_fallback(f"{company_name} data pipeline orchestration airflow dagster prefect", company_name)
+        log(f"[{company_name}] Exa failed for GitHub evidence search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} github airflow dags workflows", company_name)
 
     return result
 
@@ -781,14 +800,15 @@ def _search_hiring(
     company_name: str,
     config: ExaSearchConfig,
     rate_limiter: RateLimiter,
-    circuit_breaker: CircuitBreaker
+    circuit_breaker: CircuitBreaker,
+    domain: Optional[str] = None
 ) -> Dict:
-    """Search 3: Hiring signals (data engineer, platform engineer jobs)"""
+    """Search 3: Hiring + Tech Stack - primary source for tech stack detection from job requirements"""
     rate_limiter.acquire()
 
     # Use Brave if Exa key not available
     if not EXA_API_KEY:
-        return _brave_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
+        return _brave_search_fallback(f"{company_name} data engineer platform engineer jobs requirements", company_name)
 
     # Calculate date filter (6 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.hiring_months_back)).strftime('%Y-%m-%d')
@@ -798,13 +818,18 @@ def _search_hiring(
         "Content-Type": "application/json"
     }
 
+    # Build domain list for job boards
+    job_sites = "site:greenhouse.io OR site:lever.co OR site:jobs.lever.co OR site:boards.greenhouse.io OR site:linkedin.com/jobs"
+    if domain:
+        job_sites += f" OR site:{domain}/careers"
+
+    # Expanded to include more engineering roles
     payload = {
-        "query": f"{company_name} hiring data engineer platform engineer",
-        "numResults": 5,
+        "query": f'{company_name} ("data engineer" OR "platform engineer" OR "analytics engineer" OR "backend engineer" OR "infrastructure engineer" OR "SRE" OR "site reliability engineer") (requirements OR qualifications OR "experience with" OR "you will" OR responsibilities) {job_sites}',
+        "numResults": 10,  # Increased to get more job postings
         "type": "keyword",
-        "category": "company",
         "startPublishedDate": start_date,
-        "contents": {"highlights": True}
+        "contents": {"highlights": True, "text": True}  # Get full text for tech stack extraction
     }
 
     def make_request():
@@ -820,22 +845,22 @@ def _search_hiring(
     # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
         log(f"[{company_name}] Exa failed for hiring search, falling back to Brave Search...")
-        return _brave_search_fallback(f"{company_name} hiring data engineer platform engineer jobs", company_name)
+        return _brave_search_fallback(f"{company_name} data engineer platform engineer jobs requirements", company_name)
 
     return result
 
-def _search_news(
+def _search_trigger_events(
     company_name: str,
     config: ExaSearchConfig,
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker
 ) -> Dict:
-    """Search 4: Recent news and corporate strategy"""
+    """Search 4: Trigger Events - only funding, M&A, exec hires, not generic news"""
     rate_limiter.acquire()
 
     # Use Brave if Exa key not available
     if not EXA_API_KEY:
-        return _brave_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
+        return _brave_search_fallback(f"{company_name} funding acquisition CEO CTO hired", company_name)
 
     headers = {
         "x-api-key": EXA_API_KEY,
@@ -843,7 +868,7 @@ def _search_news(
     }
 
     payload = {
-        "query": f"{company_name} corporate strategy news 2025 2026",
+        "query": f'{company_name} (funding OR "series A" OR "series B" OR "series C" OR acquired OR acquisition OR "new CEO" OR "new CTO" OR "new CDO" OR "Chief" OR hired OR appointed) (2025 OR 2026) (site:techcrunch.com OR site:crunchbase.com OR site:businesswire.com OR site:prnewswire.com OR site:linkedin.com)',
         "numResults": 5,
         "type": "keyword",
         "contents": {"highlights": True}
@@ -861,23 +886,28 @@ def _search_news(
 
     # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for news search, falling back to Brave Search...")
-        return _brave_search_fallback(f"{company_name} corporate strategy news 2025 2026", company_name)
+        log(f"[{company_name}] Exa failed for trigger events search, falling back to Brave Search...")
+        return _brave_search_fallback(f"{company_name} funding acquisition CEO CTO hired", company_name)
 
     return result
 
-def _search_blog_posts(
+def _search_engineering_blog(
     company_name: str,
     config: ExaSearchConfig,
     rate_limiter: RateLimiter,
-    circuit_breaker: CircuitBreaker
+    circuit_breaker: CircuitBreaker,
+    domain: Optional[str] = None
 ) -> Dict:
-    """Search 5: Engineering blog posts about data infrastructure"""
+    """Search 5: Engineering Blog - company domain only, architecture/tech stack posts"""
     rate_limiter.acquire()
+
+    if not domain:
+        log(f"[{company_name}] No domain provided, skipping domain-restricted engineering blog search")
+        return {'status': 'skipped', 'error': 'No domain provided'}
 
     # Use Brave if Exa key not available
     if not EXA_API_KEY:
-        return _brave_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
+        return _brave_search_fallback(f"site:{domain} engineering blog architecture infrastructure", company_name)
 
     # Calculate date filter (18 months back)
     start_date = (datetime.now() - timedelta(days=30 * config.blog_months_back)).strftime('%Y-%m-%d')
@@ -887,8 +917,11 @@ def _search_blog_posts(
         "Content-Type": "application/json"
     }
 
+    # Try to guess medium slug
+    company_slug = company_name.lower().replace(' ', '-').replace('.', '')
+
     payload = {
-        "query": f"{company_name} engineering blog data infrastructure pipeline platform",
+        "query": f'(site:{domain}/blog OR site:{domain}/engineering OR site:medium.com/@{company_slug} OR site:{company_slug}.medium.com) (architecture OR infrastructure OR "tech stack" OR "we use" OR "how we built" OR "data platform" OR migration) (airflow OR kubernetes OR spark OR dbt OR snowflake OR databricks OR python OR aws OR gcp)',
         "numResults": 5,
         "type": "keyword",
         "startPublishedDate": start_date,
@@ -907,8 +940,8 @@ def _search_blog_posts(
 
     # Fallback to Brave if Exa fails
     if result.get('status') != 'success':
-        log(f"[{company_name}] Exa failed for blog posts search, falling back to Brave Search...")
-        return _brave_search_fallback(f"{company_name} engineering blog data infrastructure pipeline platform", company_name)
+        log(f"[{company_name}] Exa failed for engineering blog search, falling back to Brave Search...")
+        return _brave_search_fallback(f"site:{domain} engineering blog architecture infrastructure", company_name)
 
     return result
 
@@ -916,9 +949,10 @@ def _search_product_announcements(
     company_name: str,
     config: ExaSearchConfig,
     rate_limiter: RateLimiter,
-    circuit_breaker: CircuitBreaker
+    circuit_breaker: CircuitBreaker,
+    domain: Optional[str] = None
 ) -> Dict:
-    """Search 6: Product launches and announcements"""
+    """Search 6: Product launches and announcements with domain filtering"""
     rate_limiter.acquire()
 
     # Use Brave if Exa key not available
@@ -933,8 +967,10 @@ def _search_product_announcements(
         "Content-Type": "application/json"
     }
 
+    domain_clause = f"site:{domain} OR " if domain else ""
+
     payload = {
-        "query": f"{company_name} product launch announcement new feature release",
+        "query": f'{company_name} (launched OR announces OR "general availability" OR "now available" OR introducing OR "new product") (2025 OR 2026) ({domain_clause}site:producthunt.com OR site:techcrunch.com)',
         "numResults": 5,
         "type": "keyword",
         "startPublishedDate": start_date,
@@ -964,71 +1000,42 @@ def _search_case_studies(
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker
 ) -> Dict:
-    """Search 7: Case studies and customer stories (2 queries merged)"""
+    """Search 7: Vendor Case Studies - restrict to vendor domains for real case studies"""
     rate_limiter.acquire()
 
     # Use Brave if Exa key not available
     if not EXA_API_KEY:
-        return _brave_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
+        return _brave_search_fallback(f"{company_name} case study Snowflake Databricks dbt Airflow", company_name)
 
     headers = {
         "x-api-key": EXA_API_KEY,
         "Content-Type": "application/json"
     }
 
-    # Query A: Generic case studies
-    payload_a = {
-        "query": f"{company_name} case study customer story",
-        "numResults": 3,
+    # Search only on vendor domains for authentic case studies
+    payload = {
+        "query": f'{company_name} ("case study" OR "customer story" OR "success story" OR "built with") (Snowflake OR Databricks OR dbt OR Airflow OR AWS OR GCP OR Azure) (site:snowflake.com OR site:databricks.com OR site:getdbt.com OR site:aws.amazon.com OR site:cloud.google.com OR site:azure.microsoft.com)',
+        "numResults": 5,
         "type": "keyword",
         "contents": {"highlights": True}
     }
 
-    # Query B: Vendor-specific case studies
-    rate_limiter.acquire()  # Second query needs token
-    payload_b = {
-        "query": f"{company_name} Snowflake OR Databricks OR dbt OR AWS OR Google Cloud OR Azure case study OR customer OR partner",
-        "numResults": 3,
-        "type": "keyword",
-        "contents": {"highlights": True}
-    }
-
-    def make_request_a():
+    def make_request():
         return requests.post(
             "https://api.exa.ai/search",
             headers=headers,
-            json=payload_a,
+            json=payload,
             timeout=config.timeout_sec
         )
 
-    def make_request_b():
-        return requests.post(
-            "https://api.exa.ai/search",
-            headers=headers,
-            json=payload_b,
-            timeout=config.timeout_sec
-        )
+    result = _execute_search_with_retry(make_request, config, circuit_breaker)
 
-    # Execute both queries
-    result_a = _execute_search_with_retry(make_request_a, config, circuit_breaker)
-    result_b = _execute_search_with_retry(make_request_b, config, circuit_breaker)
-
-    # Merge results
-    if result_a['status'] == 'success' or result_b['status'] == 'success':
-        merged_results = []
-        if result_a['status'] == 'success':
-            merged_results.extend(result_a['data'].get('results', []))
-        if result_b['status'] == 'success':
-            merged_results.extend(result_b['data'].get('results', []))
-
-        return {
-            'status': 'success',
-            'data': {'results': merged_results}
-        }
-    else:
-        # Both Exa queries failed, fallback to Brave
+    # Fallback to Brave if Exa fails
+    if result.get('status') != 'success':
         log(f"[{company_name}] Exa failed for case studies search, falling back to Brave Search...")
-        return _brave_search_fallback(f"{company_name} case study customer story Snowflake Databricks dbt AWS", company_name)
+        return _brave_search_fallback(f"{company_name} case study Snowflake Databricks dbt Airflow", company_name)
+
+    return result
 
 def _crawl_website(
     domain: str,
@@ -1419,8 +1426,90 @@ def _aggregate_tech_stack(validated_signals: List[Dict]) -> List[Dict]:
 
 # Helper functions for metadata counting
 
+def _count_results(search_result: Dict) -> int:
+    """Generic helper to count results from a search"""
+    if search_result.get('status') == 'success':
+        return len(search_result.get('data', {}).get('results', []))
+    return 0
+
+def extract_tech_stack_from_jobs(hiring_results: Dict) -> Dict:
+    """
+    Extract tech stack mentions from job posting highlights/text.
+    This is where job postings become the primary tech stack source.
+    """
+    tech_keywords = {
+        # Orchestration
+        'airflow': 'Apache Airflow',
+        'apache airflow': 'Apache Airflow',
+        'dagster': 'Dagster',
+        'prefect': 'Prefect',
+        'luigi': 'Luigi',
+        'argo': 'Argo Workflows',
+
+        # Cloud
+        'aws': 'AWS',
+        'amazon web services': 'AWS',
+        'gcp': 'Google Cloud',
+        'google cloud': 'Google Cloud',
+        'azure': 'Microsoft Azure',
+
+        # Data Warehouse
+        'snowflake': 'Snowflake',
+        'databricks': 'Databricks',
+        'redshift': 'Amazon Redshift',
+        'bigquery': 'Google BigQuery',
+
+        # Processing
+        'spark': 'Apache Spark',
+        'flink': 'Apache Flink',
+        'kafka': 'Apache Kafka',
+
+        # Transformation
+        'dbt': 'dbt',
+        'dataform': 'Dataform',
+
+        # Container/Orchestration
+        'kubernetes': 'Kubernetes',
+        'docker': 'Docker',
+        'terraform': 'Terraform',
+
+        # Languages
+        'python': 'Python',
+        'scala': 'Scala',
+        'java': 'Java',
+        'sql': 'SQL',
+    }
+
+    tech_mentions = {}
+
+    if hiring_results.get('status') != 'success':
+        return tech_mentions
+
+    results = hiring_results.get('data', {}).get('results', [])
+    for result in results:
+        # Combine highlights and text
+        text = ' '.join(result.get('highlights', []))
+        if result.get('text'):
+            text += ' ' + result.get('text', '')
+
+        text_lower = text.lower()
+
+        for keyword, tech_name in tech_keywords.items():
+            if keyword in text_lower:
+                if tech_name not in tech_mentions:
+                    tech_mentions[tech_name] = {
+                        'count': 0,
+                        'sources': []
+                    }
+                tech_mentions[tech_name]['count'] += 1
+                if result.get('url') and result['url'] not in tech_mentions[tech_name]['sources']:
+                    tech_mentions[tech_name]['sources'].append(result.get('url', 'unknown'))
+
+    # Sort by count
+    return dict(sorted(tech_mentions.items(), key=lambda x: x[1]['count'], reverse=True))
+
 def _count_orchestration_mentions(search_results: Dict) -> int:
-    """Count orchestration tool mentions across all searches"""
+    """Count orchestration tool mentions across all searches (legacy)"""
     count = 0
     orchestration_tools = ['airflow', 'dagster', 'prefect', 'mage', 'kestra']
 
@@ -1516,10 +1605,10 @@ def fetch_exa_research_v2(
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
             executor.submit(_search_company_research, company_name, config, rate_limiter, circuit_breaker): 'company_research',
-            executor.submit(_search_orchestration, company_name, config, rate_limiter, circuit_breaker): 'orchestration',
-            executor.submit(_search_hiring, company_name, config, rate_limiter, circuit_breaker): 'hiring',
-            executor.submit(_search_news, company_name, config, rate_limiter, circuit_breaker): 'news',
-            executor.submit(_search_blog_posts, company_name, config, rate_limiter, circuit_breaker): 'blog_posts',
+            executor.submit(_search_github_evidence, company_name, config, rate_limiter, circuit_breaker): 'github_evidence',
+            executor.submit(_search_hiring, company_name, config, rate_limiter, circuit_breaker, domain): 'hiring',
+            executor.submit(_search_trigger_events, company_name, config, rate_limiter, circuit_breaker): 'trigger_events',
+            executor.submit(_search_engineering_blog, company_name, config, rate_limiter, circuit_breaker, domain): 'engineering_blog',
         }
 
         for future in as_completed(futures):
@@ -1533,7 +1622,7 @@ def fetch_exa_research_v2(
     log(f"[{company_name}] Batch B: Running 2 supplementary searches...")
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
-            executor.submit(_search_product_announcements, company_name, config, rate_limiter, circuit_breaker): 'product_announcements',
+            executor.submit(_search_product_announcements, company_name, config, rate_limiter, circuit_breaker, domain): 'product_announcements',
             executor.submit(_search_case_studies, company_name, config, rate_limiter, circuit_breaker): 'case_studies',
         }
 
@@ -1582,6 +1671,9 @@ def fetch_exa_research_v2(
     key_signals = _aggregate_signals(search_results, company_name)
     tech_stack = _aggregate_tech_stack(key_signals)  # Use validated signals only
 
+    # Extract tech stack from job postings (v2 enhancement)
+    tech_stack_from_jobs = extract_tech_stack_from_jobs(search_results.get('hiring', {}))
+
     # Build metadata
     elapsed = time.time() - start_time
     searches_completed = sum(
@@ -1594,13 +1686,15 @@ def fetch_exa_research_v2(
         'total_time_sec': round(elapsed, 2),
         'searches_completed': searches_completed,
         'searches_failed': searches_failed,
-        'orchestration_mentions': _count_orchestration_mentions(search_results),
+        'github_evidence_count': _count_results(search_results.get('github_evidence', {})),
         'hiring_signals_count': _count_hiring_signals(search_results),
-        'blog_post_count': _count_blog_posts(search_results),
+        'trigger_events_count': _count_results(search_results.get('trigger_events', {})),
+        'engineering_blog_count': _count_results(search_results.get('engineering_blog', {})),
         'product_announcement_count': _count_product_announcements(search_results),
         'case_study_count': _count_case_studies(search_results),
         'website_crawled': 'website_crawl' in search_results and search_results['website_crawl'].get('status') == 'success',
-        'job_descriptions_crawled': len(search_results.get('job_descriptions', []))
+        'job_descriptions_crawled': len(search_results.get('job_descriptions', [])),
+        'tech_stack_from_jobs': tech_stack_from_jobs  # v2: Tech stack extracted from job postings
     }
 
     # Determine overall status
@@ -2030,6 +2124,55 @@ def research_single_account(
         structured_signals_json = json.dumps(exa_v2_result.key_signals) if exa_v2_result.key_signals else None
         structured_tech_stack_json = json.dumps(exa_v2_result.tech_stack) if exa_v2_result.tech_stack else None
 
+        # v2: Extract tech stack from jobs
+        tech_stack_from_jobs = exa_v2_result.metadata.get('tech_stack_from_jobs', {})
+        tech_stack_from_jobs_json = json.dumps(tech_stack_from_jobs) if tech_stack_from_jobs else None
+
+        # v2: Detect Airflow signals
+        airflow_signals = []
+        has_airflow = False
+
+        # Check tech stack from jobs
+        if tech_stack_from_jobs.get('Apache Airflow'):
+            airflow_signals.append(f"✅ Airflow in job postings ({tech_stack_from_jobs['Apache Airflow']['count']}x)")
+            has_airflow = True
+
+        # Check GitHub evidence
+        github_results = exa_v2_result.search_results.get('github_evidence', {})
+        if github_results.get('status') == 'success' and len(github_results.get('data', {}).get('results', [])) > 0:
+            airflow_signals.append("✅ Airflow in GitHub repos")
+            has_airflow = True
+
+        # Check engineering blog
+        blog_results = exa_v2_result.search_results.get('engineering_blog', {})
+        if blog_results.get('status') == 'success' and len(blog_results.get('data', {}).get('results', [])) > 0:
+            # Check if any results mention airflow
+            for result in blog_results.get('data', {}).get('results', []):
+                if 'airflow' in str(result).lower():
+                    airflow_signals.append("✅ Airflow in engineering blog")
+                    has_airflow = True
+                    break
+
+        # Check Gong transcripts
+        if transcripts:
+            for t in transcripts:
+                if t.full_transcript and 'airflow' in t.full_transcript.lower():
+                    airflow_signals.append("✅ Airflow mentioned in Gong calls")
+                    has_airflow = True
+                    break
+
+        # v2: Classification
+        if engagement_data and engagement_data.get('is_current_cust'):
+            classification = "🟢 CUSTOMER"
+        elif has_sf_context and opp_count > 0 and call_count > 0:
+            classification = "🟡 ENGAGED PROSPECT (Active Pipeline)"
+        elif has_sf_context and call_count > 0:
+            classification = "🟡 ENGAGED PROSPECT (Evaluating)"
+        elif has_sf_context and mql_count > 0:
+            classification = "🟠 WARM LEAD"
+        else:
+            classification = "⚪ COLD PROSPECT"
+
         return ResearchResult(
             acct_id=acct_id,
             acct_name=account_name,
@@ -2051,7 +2194,11 @@ def research_single_account(
             comprehensive_report=comprehensive_report,  # v2: i360-style report
             structured_signals=structured_signals_json,  # v2: Full structured signals
             structured_tech_stack=structured_tech_stack_json,  # v2: Full tech stack with confidence
-            batch_tag=batch_tag  # Tag for this research batch
+            batch_tag=batch_tag,  # Tag for this research batch
+            tech_stack_from_jobs=tech_stack_from_jobs_json,  # v2: Tech stack from job postings
+            classification=classification,  # v2: Account classification
+            airflow_signals=airflow_signals,  # v2: Airflow detection signals
+            has_airflow_signal=has_airflow  # v2: Boolean flag
         )
 
     except Exception as e:
@@ -2253,6 +2400,165 @@ def save_to_snowflake(results: List[ResearchResult]):
     conn.close()
     log(f"✅ Saved {len(results)} results to {SNOWFLAKE_TABLE}")
 
+def save_to_v2_gtm_batch_output(results: List[ResearchResult], engagement_map: Dict, snowflake_contexts: Dict):
+    """
+    Save research results to GTM.PUBLIC.V2_GTM_BATCH_OUTPUT table.
+    This includes Snowflake context, web search results, tech stack, and classification.
+    """
+    import json
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+
+    # Helper to serialize datetime objects
+    def json_serial(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Type {type(obj)} not serializable")
+
+    with open(Path.home() / ".ssh/rsa_key_unencrypted.p8", 'rb') as key_file:
+        p_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=None,
+            backend=default_backend()
+        )
+
+    private_key_bytes = p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+    conn = snowflake.connector.connect(
+        account='GP21411.us-east-1',
+        user='VISHWASRINIVASAN',
+        private_key=private_key_bytes,
+        role='GTMADMIN',
+        warehouse='HUMANS',
+        database='GTM',
+        schema='PUBLIC'
+    )
+    cursor = conn.cursor()
+
+    for result in results:
+        try:
+            # Get engagement data
+            engagement = engagement_map.get(result.acct_name.lower(), {})
+
+            # Get Snowflake context
+            sf_context = snowflake_contexts.get(engagement.get('acct_id'), {})
+
+            # Load report JSON to get web search results
+            web_search_results = {}
+            if result.report_json_path and Path(result.report_json_path).exists():
+                try:
+                    with open(result.report_json_path, 'r') as f:
+                        report_data = json.load(f)
+                        web_search_results = report_data.get('exa_research', {}).get('search_results', {})
+                except Exception as e:
+                    log(f"Warning: Could not read web search results from {result.report_json_path}: {e}")
+
+            # Generate batch_run_id from batch_tag
+            batch_run_id = result.batch_tag or f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # Build classification and Airflow signals
+            airflow_signals = result.airflow_signals or []
+            has_airflow_signal = result.has_airflow_signal or False
+            classification = result.classification or "UNKNOWN"
+
+            # INSERT with ON CONFLICT for idempotency
+            cursor.execute('''
+                INSERT INTO V2_GTM_BATCH_OUTPUT (
+                    BATCH_RUN_ID, COMPANY_NAME, DOMAIN, RESEARCH_TIMESTAMP,
+                    SF_STATUS, SF_ACCT_ID, SF_ACCT_NAME, SF_IS_CUSTOMER, SF_PARENT_NAME,
+                    SF_CONTACT_COUNT, SF_MQL_COUNT, SF_OPP_COUNT, SF_CALL_COUNT,
+                    SF_LATEST_MQL_DATE, SF_LATEST_CALL_DATE,
+                    SF_CONTACTS, SF_MQLS, SF_OPPS, SF_GONG_CALLS,
+                    SEARCH_COMPANY_RESEARCH_COUNT, SEARCH_GITHUB_EVIDENCE_COUNT,
+                    SEARCH_HIRING_COUNT, SEARCH_TRIGGER_EVENTS_COUNT,
+                    SEARCH_ENGINEERING_BLOG_COUNT, SEARCH_PRODUCT_ANNOUNCEMENTS_COUNT,
+                    SEARCH_CASE_STUDIES_COUNT,
+                    WEB_SEARCH_COMPANY_RESEARCH, WEB_SEARCH_GITHUB_EVIDENCE,
+                    WEB_SEARCH_HIRING, WEB_SEARCH_TRIGGER_EVENTS,
+                    WEB_SEARCH_ENGINEERING_BLOG, WEB_SEARCH_PRODUCT_ANNOUNCEMENTS,
+                    WEB_SEARCH_CASE_STUDIES,
+                    TECH_STACK, CLASSIFICATION, AIRFLOW_SIGNALS, HAS_AIRFLOW_SIGNAL,
+                    RAW_JSON
+                )
+                SELECT
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s,
+                    PARSE_JSON(%s), PARSE_JSON(%s), PARSE_JSON(%s), PARSE_JSON(%s),
+                    %s, %s, %s, %s, %s, %s, %s,
+                    PARSE_JSON(%s), PARSE_JSON(%s), PARSE_JSON(%s), PARSE_JSON(%s),
+                    PARSE_JSON(%s), PARSE_JSON(%s), PARSE_JSON(%s),
+                    PARSE_JSON(%s), %s, PARSE_JSON(%s), %s,
+                    PARSE_JSON(%s)
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM V2_GTM_BATCH_OUTPUT
+                    WHERE COMPANY_NAME = %s AND RESEARCH_TIMESTAMP = %s
+                )
+            ''', (
+                batch_run_id,
+                result.acct_name,
+                None,  # domain - we don't have it in result
+                datetime.now().isoformat(),
+                # Snowflake context
+                'success' if engagement.get('acct_id') else 'not_found',
+                engagement.get('acct_id'),
+                engagement.get('acct_name'),
+                engagement.get('is_current_cust'),
+                engagement.get('parent_name'),
+                result.contact_count,
+                result.mql_count,
+                result.opp_count,
+                result.call_count,
+                result.latest_mql_date.isoformat() if result.latest_mql_date else None,
+                result.latest_call_date.isoformat() if result.latest_call_date else None,
+                json.dumps(sf_context.get('contacts', []), default=json_serial),
+                json.dumps(sf_context.get('mqls', []), default=json_serial),
+                json.dumps(sf_context.get('opps', []), default=json_serial),
+                json.dumps(sf_context.get('gong_calls', []), default=json_serial),
+                # Search counts
+                len(web_search_results.get('company_research', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('github_evidence', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('hiring', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('trigger_events', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('engineering_blog', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('product_announcements', {}).get('data', {}).get('results', [])),
+                len(web_search_results.get('case_studies', {}).get('data', {}).get('results', [])),
+                # Full web search results
+                json.dumps(web_search_results.get('company_research', {})),
+                json.dumps(web_search_results.get('github_evidence', {})),
+                json.dumps(web_search_results.get('hiring', {})),
+                json.dumps(web_search_results.get('trigger_events', {})),
+                json.dumps(web_search_results.get('engineering_blog', {})),
+                json.dumps(web_search_results.get('product_announcements', {})),
+                json.dumps(web_search_results.get('case_studies', {})),
+                # Tech stack & classification
+                result.tech_stack_from_jobs or '{}',
+                classification,
+                json.dumps(airflow_signals),
+                has_airflow_signal,
+                # Raw JSON backup
+                json.dumps(asdict(result), default=json_serial),
+                # WHERE NOT EXISTS params
+                result.acct_name,
+                datetime.now().isoformat()
+            ))
+
+            log(f"  ✓ Saved {result.acct_name} to V2_GTM_BATCH_OUTPUT")
+
+        except Exception as e:
+            log(f"  ✗ Error saving {result.acct_name} to V2_GTM_BATCH_OUTPUT: {e}")
+            continue
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    log(f"✅ Saved {len(results)} results to GTM.PUBLIC.V2_GTM_BATCH_OUTPUT")
+
 # --- Main Batch Research ---
 
 def batch_research(account_list: List[str], batch_tag: Optional[str] = None) -> List[ResearchResult]:
@@ -2310,8 +2616,12 @@ def batch_research(account_list: List[str], batch_tag: Optional[str] = None) -> 
             except Exception as e:
                 log(f"ERROR: {account_name} - {e}")
 
-    # Save results to Snowflake
+    # Save results to Snowflake (old table for backward compatibility)
     save_to_snowflake(results)
+
+    # Save to V2 GTM table with enhanced schema
+    log(f"Saving to V2_GTM_BATCH_OUTPUT...")
+    save_to_v2_gtm_batch_output(results, engagement_map, sf_context)
 
     log(f"\\n✅ Completed {len(results)}/{len(account_list)} accounts")
     if batch_tag:

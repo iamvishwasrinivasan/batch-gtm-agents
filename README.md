@@ -259,9 +259,56 @@ batch-gtm-agents/
 │   ├── account_research_report_prompt.md
 │   ├── airflow_mission_critical_assessment_prompt.md
 │   └── extract_company_metrics_prompt.md
+├── skills/                       # Claude skills (slash commands)
+│   ├── astro-brand/              # Apply Astronomer brand to visual artifacts
+│   ├── astro-docs/               # Search live Astronomer docs to answer product questions
+│   ├── astro-org-user-lookup/    # Look up Astro product users from Snowflake
+│   └── astro-pptx/               # Build branded Astronomer PowerPoint decks
 ├── README.md                    # This file
 └── .gitignore                   # Excludes sensitive data
 ```
+
+## Skills
+
+Skills are Claude slash commands that automate specific GTM tasks. Install by copying the skill folder into `~/.claude/skills/`.
+
+### `astro-brand`
+
+Applies Astronomer's 2026 brand guidelines (colors, fonts, logo rules, writing style) to any visual artifact — PDFs, HTML pages, posters, Word docs. For PowerPoint output, use `astro-pptx` instead.
+
+```
+/astro-brand
+```
+
+### `astro-docs`
+
+Searches astronomer.io and the live Astronomer docs to answer product questions. Always fetches current pages rather than relying on training data — critical since the product changes frequently (e.g., Astro Hybrid was retired). Handles pricing questions via a two-source approach: a bundled price book for structure + Snowflake Metronome queries for actual rates.
+
+```
+/astro-docs
+```
+
+**Setup:** Requires the `price-book.md` file to be present in `~/.claude/skills/astro-docs/` alongside `SKILL.md`. Also requires Snowflake access to `HQ.MODEL_FINANCE.METRONOME_RATE_CARDS` and `METRONOME_RATE_CARD_ITEMS` for pricing queries.
+
+### `astro-org-user-lookup`
+
+Looks up Astro product user names and email addresses for a customer org from Snowflake. Requires the `HQ_MODEL_ASTRO_PII_USERS_READER` role.
+
+```
+/astro-org-user-lookup [account name]
+```
+
+**Setup:** Requires Snowflake access and the `HQ_MODEL_ASTRO_PII_USERS_READER` role granted to your user.
+
+### `astro-pptx`
+
+Builds branded Astronomer PowerPoint presentations using python-pptx. Handles slide structure, dark/light mode layouts, font assignment, charts (matplotlib PNGs), and visual QA. Includes 8 named layout patterns from real Astronomer decks.
+
+```
+/astro-pptx
+```
+
+**Setup:** Requires `python-pptx` (`pip install python-pptx`). The `assets/` folder contains a real example deck for design reference. Fonts (League Gothic, Roboto, Roboto Mono) must be installed locally for full fidelity.
 
 ## Testing & Validation
 
@@ -301,8 +348,8 @@ batch-gtm-agents/
 
 For questions or issues:
 - Review prompt templates in `/prompts/README.md`
-- Check Snowflake query examples in `/Users/vishwasrinivasan/claude-work/query_comprehensive_reports.sql`
-- Test workflow documented in `/Users/vishwasrinivasan/claude-work/test_report_generation.md`
+- Check Snowflake query examples in `~/claude-work/query_comprehensive_reports.sql`
+- Test workflow documented in `~/claude-work/test_report_generation.md`
 
 ---
 

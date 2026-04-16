@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Generate discovery call plan from Snowflake account research data.
-Pulls from V2_GTM_BATCH_OUTPUT and creates tailored markdown brief.
+Generate discovery call plan from Snowflake account research data + Gong transcripts.
+Pulls from V2_GTM_BATCH_OUTPUT and analyzes Gong transcripts for context.
 """
 
 import snowflake.connector
@@ -47,6 +47,7 @@ def get_account_research(account_name):
     query = """
     SELECT
         COMPANY_NAME,
+        SF_ACCT_ID,
         SF_ACCT_NAME,
         SF_IS_CUSTOMER,
         SF_CONTACT_COUNT,
@@ -77,6 +78,8 @@ def get_account_research(account_name):
     result = cursor.fetchone()
 
     if not result:
+        cursor.close()
+        conn.close()
         return None
 
     columns = [desc[0].lower() for desc in cursor.description]
@@ -92,6 +95,7 @@ def get_account_research(account_name):
 
     # Map to expected structure for compatibility
     data['account_name'] = data.get('company_name')
+    data['acct_id'] = data.get('sf_acct_id')
     data['contact_count'] = data.get('sf_contact_count', 0)
     data['mql_count'] = data.get('sf_mql_count', 0)
     data['opp_count'] = data.get('sf_opp_count', 0)
@@ -128,175 +132,194 @@ def get_account_research(account_name):
 
     return data
 
-def detect_orchestration_tool(tech_stack):
-    """Detect current orchestration tool from tech stack."""
-    if not tech_stack:
-        return "Unknown"
+def get_gong_transcripts(acct_id, limit=5):
+    """
+    Fetch recent Gong call transcripts directly from MODEL_CRM_SENSITIVE table.
+    Returns list of transcript dicts with full text.
+    """
+    if not acct_id:
+        return []
 
-    # Look for orchestration tools in tech stack
-    orch_tools = []
-    for tech in tech_stack:
-        tech_name = tech.get('technology', '').lower()
-        if any(tool in tech_name for tool in ['airflow', 'dagster', 'prefect', 'luigi', 'oozie', 'temporal']):
-            orch_tools.append(tech.get('technology'))
+    conn = get_snowflake_connection()
+    cursor = conn.cursor()
 
-    return ", ".join(orch_tools) if orch_tools else "Unknown"
+    query = """
+    SELECT
+        CALL_ID,
+        CALL_TITLE,
+        SCHEDULED_TS,
+        ATTENDEES,
+        FULL_TRANSCRIPT
+    FROM HQ.MODEL_CRM_SENSITIVE.GONG_CALL_TRANSCRIPTS
+    WHERE ACCT_ID = %s
+    ORDER BY SCHEDULED_TS DESC
+    LIMIT %s
+    """
 
-def generate_business_questions(data):
-    """Generate tailored business questions based on account data."""
-    questions = []
+    cursor.execute(query, (acct_id, limit))
+    rows = cursor.fetchall()
 
-    # Base questions
-    questions.append("What are your current data orchestration challenges?")
+    transcripts = []
+    for row in rows:
+        transcripts.append({
+            'call_id': row[0],
+            'call_title': row[1],
+            'scheduled_ts': row[2],
+            'attendees': row[3],
+            'full_transcript': row[4]
+        })
 
-    # Tool-specific questions
-    current_tool = detect_orchestration_tool(data.get('tech_stack', []))
-    if 'airflow' in current_tool.lower():
-        questions.append("What version of Airflow are you running? How are you managing it?")
-        questions.append("What's your current deployment and upgrade process like?")
-    elif current_tool != "Unknown":
-        questions.append(f"You're using {current_tool} - what's working well? What's been frustrating?")
-    else:
-        questions.append("What tools are you currently using for data orchestration?")
+    cursor.close()
+    conn.close()
 
-    # Signal-based questions
-    if data.get('hiring_signals_count', 0) > 0:
-        questions.append("I noticed you're hiring data engineers - what's driving that growth?")
+    return transcripts
 
-    if data.get('orchestration_mentions', 0) > 20:
-        questions.append("Orchestration seems core to your stack - what triggered this conversation?")
+def analyze_transcripts(transcripts):
+    """
+    Analyze Gong transcripts to extract key context for disco plan.
+    Returns dict with insights extracted from transcripts.
+    """
+    if not transcripts:
+        return {
+            'pain_points': [],
+            'tech_stack_mentioned': [],
+            'stakeholders': set(),
+            'open_questions': [],
+            'what_was_pitched': [],
+            'customer_goals': []
+        }
 
-    # Standard questions
-    questions.append("Who owns data infrastructure decisions on your team?")
-    questions.append("What does success look like for your data team this quarter/year?")
+    insights = {
+        'pain_points': [],
+        'tech_stack_mentioned': [],
+        'stakeholders': set(),
+        'open_questions': [],
+        'what_was_pitched': [],
+        'customer_goals': []
+    }
 
-    return questions[:6]  # Max 6 questions
+    # Simple keyword extraction (could enhance with Claude API later)
+    pain_keywords = ['problem', 'issue', 'challenge', 'pain', 'struggle', 'difficult', 'frustrating', 'broken']
+    tech_keywords = ['airflow', 'snowflake', 'databricks', 'bigquery', 'redshift', 'kubernetes', 'k8s', 'docker',
+                     'dbt', 'spark', 'kafka', 'postgres', 'mysql', 'aws', 'azure', 'gcp']
+    pitch_keywords = ['astro', 'astronomer', 'managed airflow', 'cloud', 'saas']
 
-def generate_technical_questions(data):
-    """Generate tailored technical questions based on tech stack."""
-    questions = []
+    for transcript in transcripts:
+        text = transcript.get('full_transcript', '').lower()
+        title = transcript.get('call_title', '')
+        attendees = transcript.get('attendees', '')
+        date = transcript.get('scheduled_ts')
 
-    # Data platform
-    tech_stack = data.get('tech_stack', [])
-    platforms = [t['technology'] for t in tech_stack if any(p in t['technology'].lower() for p in ['snowflake', 'databricks', 'bigquery', 'redshift'])]
-    if platforms:
-        questions.append(f"Saw you're on {', '.join(platforms[:2])} - any other data platforms in use?")
-    else:
-        questions.append("What data platforms are you using? (warehouse, lakes, etc.)")
+        # Extract stakeholders from attendees
+        if attendees:
+            for attendee in attendees.split(','):
+                name = attendee.strip().replace('(employee)', '').strip()
+                if name and '(' not in name:  # Avoid empty or malformed names
+                    insights['stakeholders'].add(name)
 
-    # Pipeline complexity
-    questions.append("Can you share scale: roughly how many pipelines, tasks, daily runs?")
-    questions.append("How do you handle CI/CD for your data pipelines today?")
+        if not text:
+            continue
 
-    # Observability
-    questions.append("What's your current observability/monitoring setup for data pipelines?")
+        # Look for pain points (sentences containing pain keywords)
+        sentences = text.split('.')
+        for sentence in sentences:
+            if any(keyword in sentence for keyword in pain_keywords):
+                clean_sentence = sentence.strip()[:200]  # Limit length
+                if len(clean_sentence) > 20:  # Avoid too short
+                    insights['pain_points'].append({
+                        'context': clean_sentence,
+                        'call': title,
+                        'date': date.strftime('%Y-%m-%d') if date else 'Unknown'
+                    })
 
-    # Use case specific
-    signals = data.get('key_signals', [])
-    if signals:
-        top_signal = signals[0]
-        signal_text = top_signal.get('signal', '')
-        if 'real-time' in signal_text.lower():
-            questions.append("What real-time/streaming use cases are you supporting?")
-        elif 'ml' in signal_text.lower() or 'model' in signal_text.lower():
-            questions.append("How are you orchestrating ML pipelines and model training?")
-        elif 'quality' in signal_text.lower():
-            questions.append("How do you handle data quality checks and validation today?")
+        # Extract tech stack mentions
+        for tech in tech_keywords:
+            if tech in text:
+                insights['tech_stack_mentioned'].append(tech)
 
-    # Pain points
-    questions.append("What are the biggest pain points with your current orchestration setup?")
+        # What we pitched
+        if any(keyword in text for keyword in pitch_keywords):
+            insights['what_was_pitched'].append(f"{title} ({date.strftime('%Y-%m-%d') if date else 'Unknown'})")
 
-    return questions[:6]  # Max 6 questions
+    # Deduplicate tech stack
+    insights['tech_stack_mentioned'] = list(set(insights['tech_stack_mentioned']))
+    insights['stakeholders'] = list(insights['stakeholders'])
 
-def generate_talking_points(data):
-    """Generate tailored talking points based on account data."""
-    points = []
+    # Limit pain points to top 5 most recent
+    insights['pain_points'] = insights['pain_points'][:5]
+
+    return insights
+
+def generate_contextual_questions(data, insights):
+    """
+    Generate discovery questions informed by Gong transcript analysis.
+    """
+    biz_questions = []
+    tech_questions = []
+
+    # Reference recent calls
+    if data.get('latest_call_date'):
+        latest_date = data['latest_call_date']
+        if isinstance(latest_date, datetime):
+            latest_date_str = latest_date.strftime('%b %d')
+        else:
+            latest_date_str = 'your recent call'
+
+        # Check for specific pain points mentioned
+        if insights['pain_points']:
+            pain = insights['pain_points'][0]  # Most recent
+            biz_questions.append(f"Following up from the {pain['call']} call - has the situation with {pain['context'][:80]}... changed?")
+        else:
+            biz_questions.append(f"Since our {latest_date_str} call, what's been the biggest priority for your data team?")
+
+    # Tech stack specific questions
+    tech_mentioned = insights['tech_stack_mentioned']
+    if 'airflow' in tech_mentioned:
+        tech_questions.append("You mentioned running Airflow - what version and how is it deployed? (OSS, MWAA, Composer, etc.)")
+        tech_questions.append("What's your current process for upgrading Airflow versions?")
+    elif tech_mentioned:
+        top_tech = ', '.join(tech_mentioned[:3])
+        tech_questions.append(f"Saw you're using {top_tech} - how do you orchestrate pipelines across these systems?")
+
+    # Reference stakeholders
+    if insights['stakeholders']:
+        stakeholder_names = ', '.join(insights['stakeholders'][:2])
+        biz_questions.append(f"Is {stakeholder_names} still the key decision maker(s) for data infrastructure, or has the team structure changed?")
+
+    # Fill in standard questions if needed
+    if len(biz_questions) < 4:
+        biz_questions.extend([
+            "What are your current data orchestration challenges?",
+            "Who owns data infrastructure decisions on your team?",
+            "What does success look like for your data team this quarter/year?"
+        ])
+
+    if len(tech_questions) < 5:
+        tech_questions.extend([
+            "Can you share scale: roughly how many pipelines, tasks, daily runs?",
+            "How do you handle CI/CD for your data pipelines today?",
+            "What's your current observability/monitoring setup for data pipelines?",
+            "What are the biggest pain points with your current orchestration setup?"
+        ])
+
+    return biz_questions[:6], tech_questions[:6]
+
+def generate_call_focus(data, insights):
+    """Generate call focus based on data + transcript insights."""
+    if insights['pain_points']:
+        top_pain = insights['pain_points'][0]['context'][:100]
+        return f"They've mentioned challenges with: '{top_pain}' - dig into this and position Astro as the solution to their specific pain."
+
     grade = data.get('airflow_mission_critical_grade', 'C')
-    current_tool = detect_orchestration_tool(data.get('tech_stack', []))
-
-    # Grade-based positioning
-    if grade in ['A', 'B']:
-        points.append("**Enterprise reliability:** 99.9% uptime SLA, 24/7 support, compliance certifications (SOC2, HIPAA, etc.)")
-        points.append("**Remove infrastructure burden:** Fully managed Airflow - no K8s management, auto-scaling, automated upgrades")
-
-    # Tool-based positioning
-    if 'airflow' in current_tool.lower():
-        points.append("**Seamless upgrade path:** Migrate from OSS to Astro without rewriting DAGs")
-        points.append("**Built by Airflow creators:** 8 of top 10 Airflow committers work at Astronomer")
-        points.append("**Version management:** Easy testing of new Airflow versions before production rollout")
-    elif current_tool != "Unknown":
-        points.append("**Airflow ecosystem advantage:** Largest community (2000+ operators), battle-tested at scale")
-        points.append("**Flexibility without lock-in:** Pure Python, extensible, portable across clouds")
-
-    # Signal-based value props
-    signals = data.get('key_signals', [])
-    for signal in signals[:3]:
-        signal_text = signal.get('signal', '').lower()
-        if 'hiring' in signal_text or data.get('hiring_signals_count', 0) > 0:
-            points.append("**Reduce operational overhead:** Free up data engineers to build pipelines, not manage infrastructure")
-            break
-
-    for signal in signals[:3]:
-        signal_text = signal.get('signal', '').lower()
-        if 'scale' in signal_text or 'growth' in signal_text:
-            points.append("**Proven at scale:** Powers data infrastructure at companies like DoorDash, Coinbase, Grammarly")
-            break
-
-    if data.get('orchestration_mentions', 0) > 30:
-        points.append("**Your orchestration maturity:** With 30+ orchestration mentions, you understand the value - Astro takes it to the next level")
-
-    return points
-
-def generate_success_criteria(data):
-    """Generate success criteria checklist."""
-    criteria = [
-        "Current orchestration tool & pain points",
-        "Decision-making process & timeline",
-        "Technical requirements & constraints",
-        "Budget/procurement process",
-        "Key stakeholders & next steps"
-    ]
-    return criteria
-
-def generate_next_steps(data):
-    """Generate proposed next steps based on tier."""
-    tier = data.get('tier', 'cold_prospect')
-
-    if tier == 'customer':
-        return [
-            "Schedule technical deep-dive with their data engineering team",
-            "Upsell/expansion opportunity assessment",
-            "Executive business review planning"
-        ]
-    elif tier == 'engaged_prospect' or data.get('mql_count', 0) > 0:
-        return [
-            "POC/trial discussion with specific success criteria",
-            "Architecture review session with their team",
-            "Pricing conversation based on their scale"
-        ]
-    else:
-        return [
-            "Technical deep-dive with data engineers",
-            "Share relevant case study (similar industry/use case)",
-            "Live Astro demo focused on their specific pain points"
-        ]
-
-def generate_call_focus(data):
-    """Generate 1-2 sentence call focus recommendation."""
-    grade = data.get('airflow_mission_critical_grade', 'C')
-    current_tool = detect_orchestration_tool(data.get('tech_stack', []))
-
-    if 'airflow' in current_tool.lower():
+    if 'airflow' in insights['tech_stack_mentioned']:
         return "They're already on Airflow - focus on operational pain points (upgrades, scaling, support) and position Astro as the enterprise solution."
     elif grade in ['A', 'B']:
         return "Mission-critical data infrastructure - emphasize reliability, enterprise support, and removing operational burden from their team."
-    elif data.get('orchestration_mentions', 0) > 20:
-        return "High orchestration maturity - focus on scaling challenges and how Astro accelerates their data team's productivity."
     else:
         return "Discovery mode - understand their current setup, pain points, and assess Airflow fit for their use cases."
 
-def generate_disco_plan(account_name, data):
-    """Generate the full discovery plan markdown."""
+def generate_disco_plan_with_context(account_name, data, insights):
+    """Generate the full discovery plan markdown with Gong context."""
     today = datetime.now().strftime("%Y-%m-%d")
     research_date = data.get('research_date')
     if research_date:
@@ -320,11 +343,13 @@ def generate_disco_plan(account_name, data):
         'D': 'No evidence of Airflow usage'
     }
 
-    current_tool = detect_orchestration_tool(data.get('tech_stack', []))
-
     # Extract key technologies
     tech_stack = data.get('tech_stack', [])
-    key_techs = [t['technology'] for t in tech_stack[:8]] if tech_stack else ['No tech stack data']
+    if isinstance(tech_stack, dict):
+        tech_stack = []
+    # Combine with tech mentioned in calls
+    all_tech = set(tech_stack + insights['tech_stack_mentioned'])
+    key_techs = list(all_tech)[:8] if all_tech else ['No tech stack data']
 
     # Format signals
     signals = data.get('key_signals', [])
@@ -337,13 +362,11 @@ def generate_disco_plan(account_name, data):
     if not signals_text:
         signals_text = "No signals available\n"
 
-    # Generate questions and talking points
-    biz_questions = generate_business_questions(data)
-    tech_questions = generate_technical_questions(data)
-    talking_points = generate_talking_points(data)
-    success_criteria = generate_success_criteria(data)
-    next_steps = generate_next_steps(data)
-    call_focus = generate_call_focus(data)
+    # Generate contextual questions
+    biz_questions, tech_questions = generate_contextual_questions(data, insights)
+
+    # Call focus
+    call_focus = generate_call_focus(data, insights)
 
     # Format dates
     latest_mql = data.get('latest_mql_date')
@@ -371,9 +394,7 @@ def generate_disco_plan(account_name, data):
 ## Pre-Call Research Summary
 
 ### Company Overview
-- **Current Orchestration:** {current_tool}
-- **Orchestration Mentions:** {data.get('orchestration_mentions', 0)} references across web presence
-- **Data Stack:** {', '.join(key_techs)}
+- **Tech Stack:** {', '.join(key_techs)}
 - **Team Signals:** {data.get('hiring_signals_count', 0)} data engineering job postings
 
 ### Engagement History
@@ -381,17 +402,32 @@ def generate_disco_plan(account_name, data):
 - **MQLs:** {data.get('mql_count', 0)} (latest: {latest_mql})
 - **Opportunities:** {data.get('opp_count', 0)}
 - **Gong Calls:** {data.get('call_count', 0)} (latest: {latest_call})
-- **Email Threads:** {len(data.get('email_correspondence', []))}
 
-### Key Signals (Priority Order)
-{signals_text}
-
----
-
-## Discovery Questions
-
-### Business Questions
+### Key Stakeholders (from recent calls)
 """
+
+    if insights['stakeholders']:
+        for stakeholder in insights['stakeholders'][:5]:
+            md += f"- {stakeholder}\n"
+    else:
+        md += "- No stakeholder data available\n"
+
+    md += "\n### Recent Call Context\n"
+    if insights['pain_points']:
+        md += "\n**Pain Points Mentioned:**\n"
+        for pain in insights['pain_points'][:3]:
+            md += f"- **[{pain['call']} - {pain['date']}]** {pain['context']}\n"
+    else:
+        md += "- No transcript analysis available\n"
+
+    if insights['what_was_pitched']:
+        md += "\n**What We've Already Pitched:**\n"
+        for pitch in insights['what_was_pitched'][:3]:
+            md += f"- {pitch}\n"
+
+    md += f"\n### Key Signals (Priority Order)\n{signals_text}"
+
+    md += "\n---\n\n## Discovery Questions\n\n### Business Questions\n"
 
     for i, q in enumerate(biz_questions, 1):
         md += f"{i}. {q}\n"
@@ -400,60 +436,49 @@ def generate_disco_plan(account_name, data):
     for i, q in enumerate(tech_questions, 1):
         md += f"{i}. {q}\n"
 
-    md += "\n---\n\n## Talking Points & Value Props\n\n### Tailored to Their Situation\n\n"
-
-    for point in talking_points:
-        md += f"- {point}\n"
-
     md += "\n---\n\n## Success Criteria\n\n**By end of call, we should know:**\n\n"
+    md += f"- [ ] Current orchestration tool & pain points\n"
+    md += f"- [ ] Decision-making process & timeline\n"
+    md += f"- [ ] Technical requirements & constraints\n"
+    md += f"- [ ] Budget/procurement process\n"
+    md += f"- [ ] Key stakeholders & next steps\n"
 
-    for criterion in success_criteria:
-        md += f"- [ ] {criterion}\n"
-
-    md += "\n---\n\n## Proposed Next Steps\n\n"
-
-    for i, step in enumerate(next_steps, 1):
-        md += f"{i}. {step}\n"
-
-    md += """
----
-
-## Notes Section
-
-**Key Takeaways:**
--
-
-**Action Items:**
--
-
-**Follow-up:**
--
-
----
-
-**Call Focus:** """ + call_focus
+    md += "\n---\n\n## Notes Section\n\n**Key Takeaways:**\n-\n\n**Action Items:**\n-\n\n**Follow-up:**\n-\n\n---\n\n**Call Focus:** "
+    md += call_focus
 
     return md
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 generate_disco_plan.py <account_name>")
+        print("Usage: python3 generate_disco_plan_v2.py <account_name>")
         sys.exit(1)
 
     account_name = " ".join(sys.argv[1:])
 
-    print(f"Generating discovery plan for {account_name}...")
+    print(f"Generating contextual discovery plan for {account_name}...")
 
     # Get research data
     data = get_account_research(account_name)
 
     if not data:
         print(f"❌ No research data found for {account_name}")
-        print(f"Run research first: /batch-account-research {account_name}")
+        print(f"Run research first: python3 batch_account_research.py --accounts \"{account_name}\"")
         sys.exit(1)
 
+    # Get Gong transcripts
+    print(f"Fetching Gong transcripts...")
+    transcripts = get_gong_transcripts(data.get('acct_id'), limit=5)
+    print(f"Found {len(transcripts)} recent Gong calls")
+
+    # Analyze transcripts
+    print(f"Analyzing transcripts...")
+    insights = analyze_transcripts(transcripts)
+    print(f"  - {len(insights['pain_points'])} pain points identified")
+    print(f"  - {len(insights['stakeholders'])} stakeholders extracted")
+    print(f"  - {len(insights['tech_stack_mentioned'])} technologies mentioned")
+
     # Generate plan
-    disco_plan = generate_disco_plan(account_name, data)
+    disco_plan = generate_disco_plan_with_context(account_name, data, insights)
 
     # Save to Account Context folder
     account_folder = f"/Users/vishwasrinivasan/Account Context/{account_name}"
@@ -469,34 +494,21 @@ def main():
     print(f"\n✅ Discovery plan saved to: {filepath}")
 
     # Print summary
-    current_tool = detect_orchestration_tool(data.get('tech_stack', []))
     grade = data.get('airflow_mission_critical_grade', 'Unknown')
     tier = data.get('tier', 'Unknown')
-
-    top_signal = "N/A"
-    if data.get('key_signals'):
-        top_signal = data['key_signals'][0].get('signal', 'N/A')[:80]
-
-    latest_activity = data.get('latest_call_date') or data.get('latest_mql_date')
-    if latest_activity:
-        latest_activity = latest_activity.strftime("%Y-%m-%d")
-    else:
-        latest_activity = "No recent activity"
-
-    call_focus = generate_call_focus(data)
 
     print(f"""
 ## Discovery Plan Generated: {account_name}
 
 **Quick Context:**
 - Tier: {tier}
-- Current tool: {current_tool}
 - Airflow grade: {grade}
-- Key signal: {top_signal}
-- Last activity: {latest_activity}
+- Gong calls analyzed: {len(transcripts)}
+- Key stakeholders: {', '.join(insights['stakeholders'][:3]) if insights['stakeholders'] else 'None identified'}
+- Last call: {data.get('latest_call_date').strftime('%Y-%m-%d') if data.get('latest_call_date') else 'N/A'}
 
 **Call Focus:**
-{call_focus}
+{generate_call_focus(data, insights)}
 """)
 
 if __name__ == "__main__":

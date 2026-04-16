@@ -2411,7 +2411,10 @@ def save_to_v2_gtm_batch_output(results: List[ResearchResult], engagement_map: D
 
     # Helper to serialize datetime objects
     def json_serial(obj):
+        from datetime import date
         if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, date):
             return obj.isoformat()
         raise TypeError(f"Type {type(obj)} not serializable")
 
@@ -2583,7 +2586,31 @@ def batch_research(account_list: List[str], batch_tag: Optional[str] = None) -> 
         if data.get('has_engagement', False)
     ]
 
-    sf_context = bulk_fetch_snowflake_context(engaged_acct_ids) if engaged_acct_ids else {}
+    sf_context_raw = bulk_fetch_snowflake_context(engaged_acct_ids) if engaged_acct_ids else {}
+
+    # Transform sf_context to be indexed by acct_id instead of by category
+    sf_context = {}
+    if sf_context_raw:
+        contacts_by_acct = sf_context_raw.get('contacts_by_acct', {})
+        mqls_by_acct = sf_context_raw.get('mqls_by_acct', {})
+        opps_by_acct = sf_context_raw.get('opps_by_acct', {})
+        transcripts_by_acct = sf_context_raw.get('transcripts_by_acct', {})
+        emails_by_acct = sf_context_raw.get('emails_by_acct', {})
+
+        # Get all unique acct_ids
+        all_acct_ids = set(list(contacts_by_acct.keys()) + list(mqls_by_acct.keys()) +
+                          list(opps_by_acct.keys()) + list(transcripts_by_acct.keys()) +
+                          list(emails_by_acct.keys()))
+
+        # Build proper structure: {acct_id: {contacts: [...], mqls: [...], ...}}
+        for acct_id in all_acct_ids:
+            sf_context[acct_id] = {
+                'contacts': [asdict(c) for c in contacts_by_acct.get(acct_id, [])],
+                'mqls': [asdict(m) for m in mqls_by_acct.get(acct_id, [])],
+                'opps': [asdict(o) for o in opps_by_acct.get(acct_id, [])],
+                'gong_calls': [asdict(t) for t in transcripts_by_acct.get(acct_id, [])],
+                'emails': emails_by_acct.get(acct_id, [])
+            }
 
     # Phase 3: Parallel research (web for ALL accounts) with v2 comprehensive Exa
     log(f"Phase 3: Running comprehensive web research for {len(account_list)} accounts...")

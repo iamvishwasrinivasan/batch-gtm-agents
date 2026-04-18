@@ -1,0 +1,9 @@
+{
+  "name": "consumption-review-skill",
+  "version": "1.0.0",
+  "description": "Generate Astronomer consumption review decks",
+  "main": "scripts/deck_generator.js",
+  "dependencies": {
+    "pptxgenjs": "^3.12.0"
+  }
+}

@@ -1,8 +1,17 @@
 import csv
 import requests
 import time
+import argparse
 from typing import Optional
 from apollo_config import APOLLO_API_KEY, APOLLO_API_URL, EMAIL_ACCOUNT_ID
+
+# Try to import rep config for multi-rep support
+try:
+    from rep_config import get_email_account_id
+    SUPPORTS_MULTI_REP = True
+except ImportError:
+    SUPPORTS_MULTI_REP = False
+    print("Warning: rep_config.py not found. Multi-rep support disabled.")
 
 def search_contact(first_name: str, last_name: str, email: str) -> Optional[str]:
     """Search for a contact in Apollo and return their contact ID."""
@@ -35,7 +44,7 @@ def search_contact(first_name: str, last_name: str, email: str) -> Optional[str]
         print(f"  Error searching for {first_name} {last_name}: {e}")
         return None
 
-def add_contact_to_sequence(contact_id: str, sequence_id: str, first_name: str, last_name: str) -> dict:
+def add_contact_to_sequence(contact_id: str, sequence_id: str, first_name: str, last_name: str, email_account_id: str = None) -> dict:
     """Add a contact to a specific sequence."""
     url = f'{APOLLO_API_URL}/emailer_campaigns/{sequence_id}/add_contact_ids'
 
@@ -44,10 +53,13 @@ def add_contact_to_sequence(contact_id: str, sequence_id: str, first_name: str, 
         'Cache-Control': 'no-cache'
     }
 
+    # Use provided email_account_id or fall back to default
+    sender_account_id = email_account_id if email_account_id else EMAIL_ACCOUNT_ID
+
     payload = {
         'contact_ids': [contact_id],
         'emailer_campaign_id': sequence_id,
-        'send_email_from_email_account_id': EMAIL_ACCOUNT_ID,
+        'send_email_from_email_account_id': sender_account_id,
         'api_key': APOLLO_API_KEY
     }
 
@@ -113,7 +125,7 @@ def activate_sequence(sequence_id: str) -> dict:
             'error': str(e)
         }
 
-def process_csv(csv_file_path: str, sequence_id: str):
+def process_csv(csv_file_path: str, sequence_id: str, email_account_id: str = None):
     """Process CSV and add contacts to sequence."""
     stats = {
         'total': 0,
@@ -157,7 +169,7 @@ def process_csv(csv_file_path: str, sequence_id: str):
             print(f"  Found contact ID: {contact_id}")
 
             # Add to sequence
-            result = add_contact_to_sequence(contact_id, sequence_id, first_name, last_name)
+            result = add_contact_to_sequence(contact_id, sequence_id, first_name, last_name, email_account_id)
 
             if result['success']:
                 stats['added'] += 1
@@ -217,21 +229,45 @@ def process_csv(csv_file_path: str, sequence_id: str):
             print(f"  ✗ Failed to activate: {result.get('error', 'Unknown error')}")
 
 if __name__ == '__main__':
-    import sys
+    parser = argparse.ArgumentParser(
+        description='Add contacts from CSV to Apollo sequence',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use default email account
+  python3 add_to_specific_sequence.py "Joey_Kenney_Alumni_Prospects.csv" "69e7a4152f0c6000219d6f18"
 
-    if len(sys.argv) < 3:
-        print("Usage: python3 add_to_specific_sequence.py <csv_file> <sequence_id>")
-        print("\nExample:")
-        print('  python3 add_to_specific_sequence.py "Joey Kenney Alumni Prospects.csv" "69e7a4152f0c6000219d6f18"')
-        sys.exit(1)
+  # Send on behalf of specific rep
+  python3 add_to_specific_sequence.py "Nathan_Cooley_Alumni_Prospects.csv" "69e7a4152f0c6000219d6f18" --rep-name "Nathan Cooley"
+        """
+    )
+    parser.add_argument('csv_file', help='CSV file with contact data')
+    parser.add_argument('sequence_id', help='Apollo sequence ID')
+    parser.add_argument('--rep-name', help='Rep name for email account lookup (enables sending on behalf of rep)')
 
-    csv_file = sys.argv[1]
-    sequence_id = sys.argv[2]
+    args = parser.parse_args()
 
-    print("Apollo Sequence Enrollment")
+    # Determine email account ID
+    email_account_id = None
+    if args.rep_name:
+        if not SUPPORTS_MULTI_REP:
+            print("Error: rep_config.py not found. Cannot use --rep-name parameter.")
+            print("Create rep_config.py with rep-to-account mappings to enable multi-rep support.")
+            exit(1)
+        try:
+            email_account_id = get_email_account_id(args.rep_name, EMAIL_ACCOUNT_ID)
+            print(f"✓ Sending on behalf of: {args.rep_name}")
+            print(f"  Email account ID: {email_account_id}")
+        except ValueError as e:
+            print(f"Error: {e}")
+            exit(1)
+    else:
+        print(f"Using default email account: {EMAIL_ACCOUNT_ID}")
+
+    print("\nApollo Sequence Enrollment")
     print("="*70)
-    print(f"CSV File: {csv_file}")
-    print(f"Sequence ID: {sequence_id}")
+    print(f"CSV File: {args.csv_file}")
+    print(f"Sequence ID: {args.sequence_id}")
     print()
 
-    process_csv(csv_file, sequence_id)
+    process_csv(args.csv_file, args.sequence_id, email_account_id)

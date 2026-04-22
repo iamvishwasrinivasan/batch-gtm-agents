@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Master script to export alumni prospects from Snowflake and populate Apollo email variables.
-Usage: python3 populate_alumni_emails.py "Rep Name"
+Usage: python3 populate_alumni_emails.py "Rep Name" [--rep-name "Rep Name"]
 Example: python3 populate_alumni_emails.py "Joey Kenney"
+Example: python3 populate_alumni_emails.py "Nathan Cooley" --rep-name "Nathan Cooley"
 """
 
 import sys
@@ -10,6 +11,15 @@ import json
 import csv
 import subprocess
 import os
+import argparse
+
+# Try to import rep config to validate rep names
+try:
+    from rep_config import REP_EMAIL_ACCOUNTS
+    SUPPORTS_MULTI_REP = True
+except ImportError:
+    SUPPORTS_MULTI_REP = False
+    REP_EMAIL_ACCOUNTS = {}
 
 def export_from_snowflake(rep_name):
     """Export prospects for a specific rep from Snowflake."""
@@ -109,21 +119,40 @@ def populate_email_variables(csv_file):
     return True
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 populate_alumni_emails.py \"Rep Name\"")
-        print("\nAvailable reps:")
-        print("  - Vishwa Srinivasan")
-        print("  - Joey Kenney")
-        print("  - Joseph Mason")
-        print("  - etc.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description='Export alumni prospects from Snowflake and populate Apollo email variables',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Export and populate for a rep
+  python3 populate_alumni_emails.py "Joey Kenney"
 
-    rep_name = sys.argv[1]
+  # For multi-rep sequence enrollment (stores rep name for later use)
+  python3 populate_alumni_emails.py "Nathan Cooley" --rep-name "Nathan Cooley"
+
+Available reps (from rep_config.py):
+""" + ("\n".join([f"  - {rep}" for rep in REP_EMAIL_ACCOUNTS.keys()]) if SUPPORTS_MULTI_REP else "  (rep_config.py not found)")
+    )
+    parser.add_argument('rep_name', help='Rep name to query Snowflake alumni prospects')
+    parser.add_argument('--rep-name', dest='sending_rep', help='Rep name for sequence enrollment (stores for later use with add_to_specific_sequence.py)')
+
+    args = parser.parse_args()
+    rep_name = args.rep_name
+
+    # Validate sending_rep if provided
+    if args.sending_rep and SUPPORTS_MULTI_REP:
+        if args.sending_rep not in REP_EMAIL_ACCOUNTS:
+            print(f"Error: '{args.sending_rep}' not found in rep_config.py")
+            print(f"Available reps: {', '.join(REP_EMAIL_ACCOUNTS.keys())}")
+            sys.exit(1)
+        print(f"✓ Validated sending rep: {args.sending_rep}")
 
     print("="*70)
     print("ALUMNI EMAIL POPULATION SCRIPT")
     print("="*70)
-    print(f"Rep: {rep_name}")
+    print(f"Rep (Snowflake query): {rep_name}")
+    if args.sending_rep:
+        print(f"Rep (Sequence sender): {args.sending_rep}")
     print()
 
     # Step 1: Export from Snowflake
@@ -146,6 +175,12 @@ def main():
         print("="*70)
         print(f"All email variables populated for {rep_name}'s prospects")
         print(f"CSV saved to: {csv_file}")
+        print()
+        print("Next step: Enroll in sequence")
+        if args.sending_rep:
+            print(f'  python3 add_to_specific_sequence.py "{os.path.basename(csv_file)}" "<SEQUENCE_ID>" --rep-name "{args.sending_rep}"')
+        else:
+            print(f'  python3 add_to_specific_sequence.py "{os.path.basename(csv_file)}" "<SEQUENCE_ID>"')
     else:
         print("\n✗ Failed to populate all email variables")
         sys.exit(1)

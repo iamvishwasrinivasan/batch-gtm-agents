@@ -6,6 +6,8 @@ Automated workflow for populating personalized email sequences for Astro alumni 
 
 This workflow allows sales reps to automatically generate personalized 3-step email sequences for alumni prospects (people who used Astro at their previous company and have moved to a new company).
 
+**Standard Sequence**: https://app.apollo.io/#/sequences/69e7a4152f0c6000219d6f18
+
 ## Features
 
 - **Snowflake Integration**: Pulls alumni prospects directly from `GTM.PUBLIC.ALUMNI_PROSPECTS` table
@@ -15,16 +17,17 @@ This workflow allows sales reps to automatically generate personalized 3-step em
   - AI tooling + Blueprint product messaging
   - 6 different style variations for natural variety
 - **Apollo Integration**: Populates custom fields in Apollo for sequence use
+- **Multi-Rep Support**: Send sequences on behalf of any configured rep
 - **Sequence Enrollment**: Automatically adds contacts to Apollo sequences
 
 ## Prerequisites
 
 1. **Apollo API Access**
    - API key configured in `apollo_config.py`
-   - EMAIL_ACCOUNT_ID configured in `apollo_config.py`
+   - Rep email accounts configured in `rep_config.py`
 
 2. **Snowflake Access**
-   - Snowflake query script at `~/batch-gtm-agents/snowflake_query.py`
+   - Snowflake query script at `~/batch-gtm-agents/scripts/snowflake_query.py`
    - Access to `GTM.PUBLIC.ALUMNI_PROSPECTS` table
 
 3. **Python Dependencies**
@@ -40,14 +43,16 @@ One command to export from Snowflake and populate all email steps.
 
 **Usage:**
 ```bash
-python3 populate_alumni_emails.py "Rep Name"
+python3 populate_alumni_emails.py "Rep Name" [--rep-name "Rep Name"]
 ```
 
 **Examples:**
 ```bash
+# Default (uses default email account)
 python3 populate_alumni_emails.py "Joey Kenney"
-python3 populate_alumni_emails.py "Vishwa Srinivasan"
-python3 populate_alumni_emails.py "Joseph Mason"
+
+# Send on behalf of specific rep
+python3 populate_alumni_emails.py "Nathan Cooley" --rep-name "Nathan Cooley"
 ```
 
 **What it does:**
@@ -94,17 +99,21 @@ Enrolls contacts from CSV into an Apollo sequence.
 
 **Usage:**
 ```bash
-python3 add_to_specific_sequence.py <csv_file> <sequence_id>
+python3 add_to_specific_sequence.py <csv_file> <sequence_id> [--rep-name "Rep Name"]
 ```
 
-**Example:**
+**Examples:**
 ```bash
+# Use default email account
 python3 add_to_specific_sequence.py "Joey_Kenney_Alumni_Prospects.csv" "69e7a4152f0c6000219d6f18"
+
+# Send on behalf of Nathan Cooley
+python3 add_to_specific_sequence.py "Nathan_Cooley_Alumni_Prospects.csv" "69e7a4152f0c6000219d6f18" --rep-name "Nathan Cooley"
 ```
 
-**Finding your sequence ID:**
-- Go to your sequence in Apollo
-- Copy the ID from the URL: `https://app.apollo.io/#/sequences/YOUR_SEQUENCE_ID`
+**Standard Sequence ID:** `69e7a4152f0c6000219d6f18`
+- URL: https://app.apollo.io/#/sequences/69e7a4152f0c6000219d6f18
+- This is the standard alumni outreach sequence used by all reps
 
 ## Email Content
 
@@ -135,18 +144,41 @@ The scripts populate these Apollo custom fields:
 **To use in sequences:**
 Add `{{Email_Step_1}}`, `{{Email_Step_2}}`, `{{Email_Step_3}}` in your sequence steps.
 
-## Workflow Example
+## Quick Start
 
-### Complete workflow for a new rep:
+**Run for Nathan Cooley:**
+```bash
+cd ~/Scripts/alumni-apollo-workflow
+python3 populate_alumni_emails.py "Nathan Cooley" --rep-name "Nathan Cooley"
+python3 add_to_specific_sequence.py "Nathan_Cooley_Alumni_Prospects.csv" "69e7a4152f0c6000219d6f18" --rep-name "Nathan Cooley"
+```
+
+## Workflow Examples
+
+### For Nathan Cooley (sending on his behalf):
 
 ```bash
 # Step 1: Populate email variables
-python3 populate_alumni_emails.py "Joey Kenney"
+cd ~/Scripts/alumni-apollo-workflow
+python3 populate_alumni_emails.py "Nathan Cooley" --rep-name "Nathan Cooley"
 
-# Step 2: Enroll in sequence (optional)
+# Step 2: Enroll in sequence
 python3 add_to_specific_sequence.py \
-  "/Users/vishwasrinivasan/Downloads/Joey_Kenney_Alumni_Prospects.csv" \
-  "YOUR_SEQUENCE_ID"
+  "Nathan_Cooley_Alumni_Prospects.csv" \
+  "69e7a4152f0c6000219d6f18" \
+  --rep-name "Nathan Cooley"
+```
+
+### For your own prospects (default):
+
+```bash
+# Step 1: Populate email variables
+python3 populate_alumni_emails.py "Vishwa Srinivasan"
+
+# Step 2: Enroll in sequence
+python3 add_to_specific_sequence.py \
+  "Vishwa_Srinivasan_Alumni_Prospects.csv" \
+  "69e7a4152f0c6000219d6f18"
 ```
 
 ### Results:

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+Master script to export alumni prospects from Snowflake and populate Apollo email variables.
+Usage: python3 populate_alumni_emails.py "Rep Name"
+Example: python3 populate_alumni_emails.py "Joey Kenney"
+"""
+
+import sys
+import json
+import csv
+import subprocess
+import os
+
+def export_from_snowflake(rep_name):
+    """Export prospects for a specific rep from Snowflake."""
+    print(f"Exporting alumni prospects for {rep_name} from Snowflake...")
+
+    query = f"""
+    SELECT
+        FIRST_NAME,
+        LAST_NAME,
+        NEW_COMPANY,
+        OLD_COMPANY,
+        OLD_ACCT_STATUS,
+        ROLE_AT_OLD_ORG,
+        OLD_ORG_ARR,
+        OLD_ORG_PLAN,
+        LOGIN_COUNT,
+        GONG_CALLS,
+        ZD_TICKETS,
+        LAST_LOGIN,
+        TENURE_MONTHS,
+        NEW_TITLE,
+        NEW_EMAIL,
+        EMAIL_TYPE,
+        LINKEDIN_URL,
+        NEW_CO_EMPLOYEES,
+        NEW_CO_COUNTRY,
+        MONTHS_SINCE_JOB_CHANGE,
+        MATCH_METHOD,
+        SF_ACCOUNT_EXISTS,
+        SF_ACCOUNT_OWNER,
+        SF_ACCOUNT_URL,
+        NEW_CO_IS_ASTRO_CUSTOMER
+    FROM GTM.PUBLIC.ALUMNI_PROSPECTS
+    WHERE SF_ACCOUNT_OWNER = '{rep_name}'
+    ORDER BY MONTHS_SINCE_JOB_CHANGE
+    """
+
+    # Run Snowflake query
+    result = subprocess.run(
+        ['python3', f'{os.path.expanduser("~")}/batch-gtm-agents/snowflake_query.py', query],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print(f"Error querying Snowflake: {result.stderr}")
+        return None
+
+    # Parse JSON result
+    data = json.loads(result.stdout)
+
+    if not data.get('success'):
+        print(f"Query failed: {data.get('error')}")
+        return None
+
+    results = data.get('results', [])
+    print(f"✓ Found {len(results)} prospects for {rep_name}")
+
+    if not results:
+        print("No prospects found for this rep")
+        return None
+
+    # Write to CSV
+    csv_file = f'/Users/vishwasrinivasan/Downloads/{rep_name.replace(" ", "_")}_Alumni_Prospects.csv'
+    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"✓ Created CSV: {csv_file}")
+    return csv_file
+
+def populate_email_variables(csv_file):
+    """Run the three email population scripts."""
+    scripts = [
+        'add_email_drafts_to_apollo.py',
+        'add_email_step2_to_apollo.py',
+        'add_email_step3_to_apollo.py'
+    ]
+
+    script_dir = '/Users/vishwasrinivasan/Scripts'
+
+    for script in scripts:
+        print(f"\n{'='*70}")
+        print(f"Running {script}...")
+        print('='*70)
+
+        result = subprocess.run(
+            ['python3', f'{script_dir}/{script}', csv_file],
+            cwd=script_dir
+        )
+
+        if result.returncode != 0:
+            print(f"✗ {script} failed")
+            return False
+
+    return True
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 populate_alumni_emails.py \"Rep Name\"")
+        print("\nAvailable reps:")
+        print("  - Vishwa Srinivasan")
+        print("  - Joey Kenney")
+        print("  - Joseph Mason")
+        print("  - etc.")
+        sys.exit(1)
+
+    rep_name = sys.argv[1]
+
+    print("="*70)
+    print("ALUMNI EMAIL POPULATION SCRIPT")
+    print("="*70)
+    print(f"Rep: {rep_name}")
+    print()
+
+    # Step 1: Export from Snowflake
+    csv_file = export_from_snowflake(rep_name)
+
+    if not csv_file:
+        print("\nExiting due to export failure")
+        sys.exit(1)
+
+    # Step 2: Populate email variables in Apollo
+    print("\n" + "="*70)
+    print("POPULATING APOLLO EMAIL VARIABLES")
+    print("="*70)
+
+    success = populate_email_variables(csv_file)
+
+    if success:
+        print("\n" + "="*70)
+        print("✓ COMPLETE")
+        print("="*70)
+        print(f"All email variables populated for {rep_name}'s prospects")
+        print(f"CSV saved to: {csv_file}")
+    else:
+        print("\n✗ Failed to populate all email variables")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

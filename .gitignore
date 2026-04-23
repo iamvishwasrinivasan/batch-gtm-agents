@@ -70,3 +70,7 @@ temp/
 gong-cache/
 *_cache/
 transcripts/
+
+# Snowflake SSH keys
+DAGs/include/.ssh/
+include/.ssh/

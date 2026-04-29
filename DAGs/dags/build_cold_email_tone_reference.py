@@ -9,7 +9,7 @@ and loads them into GTM.PUBLIC.COLD_EMAIL_TONE for LLM tone training.
 **To change filters:** Edit the EMAIL_FILTERS config below and redeploy with `astro deploy --dags`
 """
 
-from airflow.sdk import dag
+from airflow.decorators import dag
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 from pendulum import datetime
 

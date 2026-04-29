@@ -9,9 +9,9 @@ and loads them into GTM.PUBLIC.COLD_EMAIL_TONE for LLM tone training.
 **To change filters:** Edit the EMAIL_FILTERS config below and redeploy with `astro deploy --dags`
 """
 
-from airflow.decorators import dag
+from datetime import datetime
+from airflow import DAG
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
-from pendulum import datetime
 
 
 # ============================================================================
@@ -49,18 +49,20 @@ EMAIL_FILTERS = {
 }
 
 
-@dag(
+default_args = {
+    "owner": "GTM",
+    "retries": 2,
+}
+
+with DAG(
+    dag_id="build_cold_email_tone_reference",
     start_date=datetime(2026, 4, 29),
     schedule=None,  # Manual trigger only
     catchup=False,
     doc_md=__doc__,
-    default_args={
-        "owner": "GTM",
-        "retries": 2,
-    },
+    default_args=default_args,
     tags=["gtm", "email", "llm-training", "manual"],
-)
-def build_cold_email_tone_reference():
+) as dag:
 
     create_target_table = SnowflakeOperator(
         task_id="create_target_table",
@@ -163,7 +165,3 @@ def build_cold_email_tone_reference():
 
     # Define dependencies
     create_target_table >> extract_and_load_emails >> validate_row_count
-
-
-# Instantiate the DAG
-dag_instance = build_cold_email_tone_reference()

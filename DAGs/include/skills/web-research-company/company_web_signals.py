@@ -50,11 +50,23 @@ class CompanyWebSignals:
             self.sf_config = {
                 'account': os.getenv('SNOWFLAKE_ACCOUNT'),
                 'user': os.getenv('SNOWFLAKE_USER'),
-                'private_key_path': os.getenv('SNOWFLAKE_PRIVATE_KEY_PATH', '/usr/local/airflow/include/.ssh/rsa_key.p8'),
                 'role': os.getenv('SNOWFLAKE_ROLE', 'GTMADMIN'),
                 'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'HUMANS'),
                 'database': os.getenv('SNOWFLAKE_DATABASE', 'GTM')
             }
+
+            # Load private key from environment variable (base64 encoded)
+            import base64
+            private_key_b64 = os.getenv('SNOWFLAKE_PRIVATE_KEY')
+            if not private_key_b64:
+                raise ValueError("SNOWFLAKE_PRIVATE_KEY environment variable required")
+
+            private_key_bytes = base64.b64decode(private_key_b64)
+            p_key = serialization.load_pem_private_key(
+                private_key_bytes,
+                password=None,
+                backend=default_backend()
+            )
         else:
             # Running locally - use YAML config
             snowflake_config_path = Path.home() / ".snowflake/service_config.yaml"
@@ -62,16 +74,16 @@ class CompanyWebSignals:
                 config_data = yaml.safe_load(f)
                 self.sf_config = config_data['snowflake']
 
-        # Load private key
-        private_key_path = Path(self.sf_config['private_key_path'])
-        if str(private_key_path).startswith('~'):
-            private_key_path = private_key_path.expanduser()
-        with open(private_key_path, "rb") as key_file:
-            p_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None,
-                backend=default_backend()
-            )
+            # Load private key from file
+            private_key_path = Path(self.sf_config['private_key_path'])
+            if str(private_key_path).startswith('~'):
+                private_key_path = private_key_path.expanduser()
+            with open(private_key_path, "rb") as key_file:
+                p_key = serialization.load_pem_private_key(
+                    key_file.read(),
+                    password=None,
+                    backend=default_backend()
+                )
 
         self.private_key = p_key.private_bytes(
             encoding=serialization.Encoding.DER,

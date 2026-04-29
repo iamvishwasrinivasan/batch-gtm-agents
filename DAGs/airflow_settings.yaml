@@ -7,15 +7,18 @@
 
 airflow:
   connections:
-    - conn_id:
-      conn_type:
-      conn_host:
-      conn_schema:
-      conn_login:
-      conn_password:
-      conn_port:
+    - conn_id: snowflake_default
+      conn_type: snowflake
+      conn_host: GP21411.us-east-1
+      conn_schema: MODEL_CRM_PII
+      conn_login: VISHWASRINIVASAN
+      conn_password: ${SNOWFLAKE_PASSWORD}  # Set this in .env file
       conn_extra:
-        example_extra_field: example-value
+        account: GP21411.us-east-1
+        warehouse: HUMANS
+        database: HQ
+        role: GTMADMIN
+        region: us-east-1
   pools:
     - pool_name:
       pool_slot:

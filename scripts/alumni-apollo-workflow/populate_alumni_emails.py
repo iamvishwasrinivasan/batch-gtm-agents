@@ -59,7 +59,7 @@ def export_from_snowflake(rep_name):
 
     # Run Snowflake query
     result = subprocess.run(
-        ['python3', f'{os.path.expanduser("~")}/batch-gtm-agents/snowflake_query.py', query],
+        ['python3', f'{os.path.expanduser("~")}/batch-gtm-agents/scripts/snowflake_query.py', query],
         capture_output=True,
         text=True
     )

@@ -166,4 +166,4 @@ def build_cold_email_tone_reference():
 
 
 # Instantiate the DAG
-build_cold_email_tone_reference()
+dag_instance = build_cold_email_tone_reference()

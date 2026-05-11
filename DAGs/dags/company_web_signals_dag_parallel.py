@@ -19,7 +19,8 @@ from airflow.decorators import task
 import sys
 
 # Add the skills directory to Python path (in Astro, use /usr/local/airflow/include)
-sys.path.insert(0, "/usr/local/airflow/include/skills/web-research-company")
+SKILLS_DIR = Path("/usr/local/airflow/include/skills/web-research-company")
+sys.path.insert(0, str(SKILLS_DIR))
 
 from company_web_signals import CompanyWebSignals
 
@@ -159,7 +160,7 @@ def summarize_results(results: List[Dict]) -> None:
 
 # DAG definition
 default_args = {
-    'owner': 'airflow',
+    'owner': 'vishwasrinivasan',
     'depends_on_past': False,
     'email_on_failure': False,
     'email_on_retry': False,

@@ -13,6 +13,7 @@ Usage:
 import json
 import sys
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -39,51 +40,57 @@ class CompanyWebSignals:
 
     def __init__(self):
         """Initialize with Snowflake and Exa connections."""
-        self.exa_api_key = os.getenv('EXA_API_KEY')
-        if not self.exa_api_key:
-            raise ValueError("EXA_API_KEY environment variable required")
+        # Exa API key is loaded lazily when needed (for research methods only)
+        self.exa_api_key = None
 
-        # Load Snowflake config from environment variables (for Astro deployment)
-        # Falls back to YAML config file for local development
-        if os.getenv('SNOWFLAKE_ACCOUNT'):
-            # Running in Astro - use environment variables
-            self.sf_config = {
-                'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-                'user': os.getenv('SNOWFLAKE_USER'),
-                'role': os.getenv('SNOWFLAKE_ROLE', 'GTMADMIN'),
-                'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'HUMANS'),
-                'database': os.getenv('SNOWFLAKE_DATABASE', 'GTM')
-            }
-
-            # Load private key from environment variable (base64 encoded)
-            import base64
-            private_key_b64 = os.getenv('SNOWFLAKE_PRIVATE_KEY')
-            if not private_key_b64:
-                raise ValueError("SNOWFLAKE_PRIVATE_KEY environment variable required")
-
-            private_key_bytes = base64.b64decode(private_key_b64)
-            p_key = serialization.load_pem_private_key(
-                private_key_bytes,
-                password=None,
-                backend=default_backend()
-            )
-        else:
-            # Running locally - use YAML config
-            snowflake_config_path = Path.home() / ".snowflake/service_config.yaml"
+        # Prefer local Snowflake config for laptop usage, fall back to Astro env vars
+        snowflake_config_path = Path.home() / ".snowflake/service_config.yaml"
+        if snowflake_config_path.exists():
             with open(snowflake_config_path) as f:
                 config_data = yaml.safe_load(f)
                 self.sf_config = config_data['snowflake']
+        else:
+            self.sf_config = {
+                'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+                'user': os.getenv('SNOWFLAKE_USER'),
+                'private_key_path': os.getenv(
+                    'SNOWFLAKE_PRIVATE_KEY_PATH',
+                    '/usr/local/airflow/include/.ssh/rsa_key.p8',
+                ),
+                'role': os.getenv('SNOWFLAKE_ROLE', 'GTMADMIN'),
+                'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE', 'HUMANS'),
+                'database': os.getenv('SNOWFLAKE_DATABASE', 'GTM'),
+            }
 
-            # Load private key from file
-            private_key_path = Path(self.sf_config['private_key_path'])
-            if str(private_key_path).startswith('~'):
-                private_key_path = private_key_path.expanduser()
+            missing = [
+                key for key in ('account', 'user', 'role', 'warehouse', 'database')
+                if not self.sf_config.get(key)
+            ]
+            if missing:
+                raise ValueError(
+                    f"Missing Snowflake environment variables: {', '.join(missing)}"
+                )
+
+        # Prefer the bundled key file in Astro if it exists; otherwise fall back to env var
+        private_key_path = Path(self.sf_config['private_key_path']).expanduser()
+        private_key_value = os.getenv('SNOWFLAKE_PRIVATE_KEY')
+        if private_key_path.exists():
             with open(private_key_path, "rb") as key_file:
                 p_key = serialization.load_pem_private_key(
                     key_file.read(),
                     password=None,
                     backend=default_backend()
                 )
+        elif private_key_value:
+            p_key = serialization.load_pem_private_key(
+                private_key_value.replace('\\n', '\n').encode(),
+                password=None,
+                backend=default_backend()
+            )
+        else:
+            raise ValueError(
+                f"No Snowflake private key found at {private_key_path} and SNOWFLAKE_PRIVATE_KEY is unset"
+            )
 
         self.private_key = p_key.private_bytes(
             encoding=serialization.Encoding.DER,
@@ -133,6 +140,12 @@ class CompanyWebSignals:
     def _exa_search(self, query: str, num_results: int = 10,
                     start_published_date: Optional[str] = None) -> List[Dict]:
         """Execute Exa search via API."""
+        # Load Exa API key lazily when first needed
+        if not self.exa_api_key:
+            self.exa_api_key = os.getenv('EXA_API_KEY')
+            if not self.exa_api_key:
+                raise ValueError("EXA_API_KEY environment variable required")
+
         url = "https://api.exa.ai/search"
         headers = {
             "Content-Type": "application/json",
@@ -157,6 +170,13 @@ class CompanyWebSignals:
             response.raise_for_status()
             data = response.json()
             return data.get('results', [])
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 402:
+                raise RuntimeError(
+                    "Exa API returned 402 Payment Required; aborting run instead of writing empty results"
+                ) from e
+            print(f"  ⚠ Exa search failed: {e}")
+            return []
         except Exception as e:
             print(f"  ⚠ Exa search failed: {e}")
             return []
@@ -181,18 +201,35 @@ class CompanyWebSignals:
         company_lower = company_name.lower()
         domain_parts = domain.replace('www.', '').split('.')[0].lower()
 
-        return company_lower in text or domain_parts in text
+        # Always accept domain match (highest confidence)
+        if domain_parts in text:
+            return True
 
-    def research_company_overview(self, company_name: str, domain: str) -> str:
+        # For generic/short names (≤4 chars), require word boundaries
+        if len(company_name) <= 4:
+            return bool(re.search(rf'\b{re.escape(company_lower)}\b', text))
+
+        # Longer names can use substring match
+        return company_lower in text
+
+    def research_company_overview(self, company_name: str, domain: str,
+                                   domain_restricted: bool = False) -> str:
         """Research company overview."""
         print(f"  → Researching company overview...")
 
+        # Always prioritize site search for about page
         about_results = self._exa_search(f"site:{domain} about OR company", num_results=3)
-        desc_results = self._exa_search(
-            f"{company_name} company overview industry",
-            num_results=5,
-            start_published_date=(datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        )
+
+        if domain_restricted:
+            # For generic names, only use site search
+            desc_results = []
+        else:
+            # For normal names, also search broader web
+            desc_results = self._exa_search(
+                f"{company_name} company overview industry",
+                num_results=5,
+                start_published_date=(datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+            )
 
         all_results = about_results + desc_results
         overview_text = "\n\n".join([
@@ -208,9 +245,10 @@ class CompanyWebSignals:
 
         twelve_months_ago = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
 
+        # Job boards (Greenhouse, Lever, Ashby)
         jobs_1 = self._exa_search(
             f"(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com) {domain} "
-            f"(data engineer OR data platform OR ML engineer OR analytics engineer)",
+            f"(data engineer OR data platform OR ML engineer OR analytics engineer OR GTM Engineer)",
             num_results=10,
             start_published_date=twelve_months_ago
         )
@@ -221,13 +259,29 @@ class CompanyWebSignals:
             start_published_date=twelve_months_ago
         )
 
+        # LinkedIn
         jobs_3 = self._exa_search(
-            f"site:linkedin.com/jobs {company_name} (data engineer OR Airflow)",
+            f"site:linkedin.com/jobs {company_name} (data engineer OR Airflow OR GTM Engineer)",
             num_results=10,
             start_published_date=twelve_months_ago
         )
 
-        all_jobs = jobs_1 + jobs_2 + jobs_3
+        # Company career pages (jobs, careers, join, hiring pages)
+        jobs_4 = self._exa_search(
+            f"site:{domain} (data engineer OR analytics engineer OR ML engineer OR platform engineer OR GTM Engineer)",
+            num_results=10,
+            start_published_date=twelve_months_ago
+        )
+
+        # Glassdoor & Indeed
+        jobs_5 = self._exa_search(
+            f"(site:glassdoor.com OR site:indeed.com) {company_name} "
+            f"(data engineer OR analytics engineer OR Airflow OR data platform OR GTM Engineer)",
+            num_results=10,
+            start_published_date=twelve_months_ago
+        )
+
+        all_jobs = jobs_1 + jobs_2 + jobs_3 + jobs_4 + jobs_5
         seen_urls = set()
         unique_jobs = []
 
@@ -250,16 +304,19 @@ class CompanyWebSignals:
 
         return unique_jobs[:20]
 
-    def research_major_announcements(self, company_name: str, domain: str) -> List[Dict]:
+    def research_major_announcements(self, company_name: str, domain: str,
+                                     domain_restricted: bool = False) -> List[Dict]:
         """Research major company announcements (acquisitions, expansions, major initiatives)."""
         print(f"  → Researching major announcements...")
 
         two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        results = self._exa_search(
-            f"{company_name} acquisition OR acquired OR expansion OR launches OR opens",
-            num_results=15,
-            start_published_date=two_years_ago
-        )
+
+        if domain_restricted:
+            query = f"site:{domain} acquisition OR acquired OR expansion OR launches OR opens"
+        else:
+            query = f"{company_name} acquisition OR acquired OR expansion OR launches OR opens"
+
+        results = self._exa_search(query, num_results=15, start_published_date=two_years_ago)
 
         return [{
             'title': r.get('title', ''),
@@ -268,16 +325,19 @@ class CompanyWebSignals:
             'summary': r.get('text', '')[:1000]
         } for r in results if self._is_relevant(r, company_name, domain)]
 
-    def research_product_releases(self, company_name: str, domain: str) -> List[Dict]:
+    def research_product_releases(self, company_name: str, domain: str,
+                                   domain_restricted: bool = False) -> List[Dict]:
         """Research product launches."""
         print(f"  → Researching product releases...")
 
         two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        results = self._exa_search(
-            f"{company_name} product launch OR release OR announces",
-            num_results=15,
-            start_published_date=two_years_ago
-        )
+
+        if domain_restricted:
+            query = f"site:{domain} product launch OR release OR announces"
+        else:
+            query = f"{company_name} product launch OR release OR announces"
+
+        results = self._exa_search(query, num_results=15, start_published_date=two_years_ago)
 
         return [{
             'title': r.get('title', ''),
@@ -286,16 +346,19 @@ class CompanyWebSignals:
             'summary': r.get('text', '')[:1000]
         } for r in results if self._is_relevant(r, company_name, domain)]
 
-    def research_c_suite_hires(self, company_name: str, domain: str) -> List[Dict]:
+    def research_c_suite_hires(self, company_name: str, domain: str,
+                                domain_restricted: bool = False) -> List[Dict]:
         """Research C-suite hires."""
         print(f"  → Researching C-suite hires...")
 
         two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        results = self._exa_search(
-            f"{company_name} (CEO OR CTO OR CFO) (hire OR appointed OR joins)",
-            num_results=15,
-            start_published_date=two_years_ago
-        )
+
+        if domain_restricted:
+            query = f"site:{domain} (CEO OR CTO OR CFO) (hire OR appointed OR joins)"
+        else:
+            query = f"{company_name} (CEO OR CTO OR CFO) (hire OR appointed OR joins)"
+
+        results = self._exa_search(query, num_results=15, start_published_date=two_years_ago)
 
         return [{
             'title': r.get('title', ''),
@@ -304,16 +367,19 @@ class CompanyWebSignals:
             'summary': r.get('text', '')[:1000]
         } for r in results if self._is_relevant(r, company_name, domain)]
 
-    def research_strategic_announcements(self, company_name: str, domain: str) -> List[Dict]:
+    def research_strategic_announcements(self, company_name: str, domain: str,
+                                         domain_restricted: bool = False) -> List[Dict]:
         """Research strategic announcements."""
         print(f"  → Researching strategic announcements...")
 
         two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        results = self._exa_search(
-            f"{company_name} strategy OR partnership OR expansion",
-            num_results=15,
-            start_published_date=two_years_ago
-        )
+
+        if domain_restricted:
+            query = f"site:{domain} strategy OR partnership OR expansion"
+        else:
+            query = f"{company_name} strategy OR partnership OR expansion"
+
+        results = self._exa_search(query, num_results=15, start_published_date=two_years_ago)
 
         return [{
             'title': r.get('title', ''),
@@ -322,16 +388,19 @@ class CompanyWebSignals:
             'summary': r.get('text', '')[:1000]
         } for r in results if self._is_relevant(r, company_name, domain)]
 
-    def research_company_metrics(self, company_name: str, domain: str) -> List[Dict]:
+    def research_company_metrics(self, company_name: str, domain: str,
+                                  domain_restricted: bool = False) -> List[Dict]:
         """Research company metrics (growth, funding, employee counts, public disclosures)."""
         print(f"  → Researching company metrics...")
 
         two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        results = self._exa_search(
-            f"{company_name} employees OR funding OR revenue OR growth OR valuation",
-            num_results=10,
-            start_published_date=two_years_ago
-        )
+
+        if domain_restricted:
+            query = f"site:{domain} employees OR funding OR revenue OR growth OR valuation"
+        else:
+            query = f"{company_name} employees OR funding OR revenue OR growth OR valuation"
+
+        results = self._exa_search(query, num_results=10, start_published_date=two_years_ago)
 
         return [{
             'title': r.get('title', ''),
@@ -346,14 +415,35 @@ class CompanyWebSignals:
         print(f"Researching: {company_name} ({domain})")
         print(f"{'='*60}")
 
+        # Check if company name is generic (≤4 chars)
+        is_generic_name = len(company_name) <= 4
+        if is_generic_name:
+            print(f"  ⚠ Generic name detected ('{company_name}'). Using domain-restricted searches.")
+
         try:
-            overview = self.research_company_overview(company_name, domain)
+            # For generic names, restrict all searches except jobs to site:{domain}
+            overview = self.research_company_overview(
+                company_name, domain, domain_restricted=is_generic_name
+            )
+            # Jobs are NOT domain-restricted - they search job boards with good filters
             jobs = self.research_jobs(company_name, domain)
-            major_announcements = self.research_major_announcements(company_name, domain)
-            products = self.research_product_releases(company_name, domain)
-            hires = self.research_c_suite_hires(company_name, domain)
-            announcements = self.research_strategic_announcements(company_name, domain)
-            metrics = self.research_company_metrics(company_name, domain)
+
+            # All other searches are domain-restricted for generic names
+            major_announcements = self.research_major_announcements(
+                company_name, domain, domain_restricted=is_generic_name
+            )
+            products = self.research_product_releases(
+                company_name, domain, domain_restricted=is_generic_name
+            )
+            hires = self.research_c_suite_hires(
+                company_name, domain, domain_restricted=is_generic_name
+            )
+            announcements = self.research_strategic_announcements(
+                company_name, domain, domain_restricted=is_generic_name
+            )
+            metrics = self.research_company_metrics(
+                company_name, domain, domain_restricted=is_generic_name
+            )
 
             print(f"\n  ✓ Research complete:")
             print(f"    - Overview: {len(overview)} chars")

@@ -1,0 +1,20 @@
+{
+  "greenhouse": {
+    "api_url": "https://api.greenhouse.io/v1/boards/{slug}/jobs",
+    "detect_pattern": "greenhouse.io",
+    "rate_limit_ms": 300,
+    "method": "GET"
+  },
+  "lever": {
+    "api_url": "https://api.lever.co/v0/postings/{slug}",
+    "detect_pattern": "lever.co",
+    "rate_limit_ms": 300,
+    "method": "GET"
+  },
+  "ashby": {
+    "api_url": "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams",
+    "detect_pattern": "ashbyhq.com",
+    "rate_limit_ms": 500,
+    "method": "POST"
+  }
+}
